@@ -34,7 +34,7 @@ DEFAULT_SIZE_LEVELS = {
 # Data Loading
 # =============================================================================
 
-def load_token_frequencies(data_bin_path):
+def load_token_frequencies(data_bin_path, token_offset=0):
     """
     Compute per-token frequencies from a binary training dataset.
 
@@ -44,14 +44,14 @@ def load_token_frequencies(data_bin_path):
     """
     from .common import COMPOSITE_DTYPE
 
-    print(f"[INFO] Computing token frequencies from: {data_bin_path}")
+    print(f"[INFO] Computing token frequencies from: {data_bin_path} (token_offset={token_offset})")
     if not os.path.exists(data_bin_path):
         print("[WARN] Dataset file not found. Returning empty counts.")
         return {}
 
     data_raw = np.fromfile(data_bin_path, dtype=COMPOSITE_DTYPE)
-    shifted_tokens = data_raw['DATA'] + 1
-    unique, counts = np.unique(shifted_tokens, return_counts=True)
+    tokens = data_raw['DATA'] + int(token_offset)
+    unique, counts = np.unique(tokens, return_counts=True)
     token_counts = dict(zip(unique.tolist(), counts.tolist()))
     print(f"[OK]  {len(token_counts)} unique tokens")
     return token_counts
@@ -91,23 +91,76 @@ def load_chapter_metadata(csv_path, start_token_id=22):
 # Embedding Extraction
 # =============================================================================
 
-def get_embeddings(ckpt_path, token_meta):
+def load_neutral_total(data_bin_path, total_vocab_size=None):
     """
-    Extract token embeddings from a trained checkpoint.
+    Compute a neutral TOTAL token from data (rounded mean of observed TOTAL values).
+    """
+    from .common import COMPOSITE_DTYPE
+
+    print(f"[INFO] Computing neutral TOTAL from: {data_bin_path}")
+    if not os.path.exists(data_bin_path):
+        print("[WARN] Dataset file not found. Using neutral TOTAL token = 0.")
+        return 0
+
+    data_raw = np.fromfile(data_bin_path, dtype=COMPOSITE_DTYPE)
+    total_vals = data_raw['TOTAL'].astype(np.int64)
+    total_vals = total_vals[np.isfinite(total_vals)]
+    mean_total = int(np.rint(total_vals.mean())) if len(total_vals) else 0
+    if total_vocab_size is not None:
+        mean_total = int(np.clip(mean_total, 0, int(total_vocab_size) - 1))
+    print(f"[OK]  neutral TOTAL token = {mean_total}")
+    return mean_total
+
+
+def get_embeddings(
+    ckpt_path,
+    token_meta,
+    repr_mode='projected_data_only',
+    neutral_total=0,
+    neutral_shift=0,
+    model=None,
+):
+    """
+    Extract token representations from a trained checkpoint.
 
     Returns
     -------
     embeddings : np.ndarray  (n_tokens, n_embd)
     valid_token_ids : list[int]
+    token_offset : int
     """
-    from figutils.common import load_model
+    if model is None:
+        from figutils.common import load_model
+        print(f"[INFO] Loading embeddings from {ckpt_path}")
+        model, ckpt = load_model(ckpt_path, device='cpu')
+    else:
+        print(f"[INFO] Using preloaded model for embeddings from {ckpt_path}")
 
-    print(f"[INFO] Loading embeddings from {ckpt_path}")
-    model, ckpt = load_model(ckpt_path, device='cpu')
-
-    full_emb = model.composite_emb.data_emb.weight.detach().numpy()
+    token_offset = 1 if bool(getattr(model.config, 'apply_token_shift', False)) else 0
     valid_ids = sorted(token_meta.keys())
-    return full_emb[valid_ids], valid_ids
+    token_ids = torch.tensor(valid_ids, dtype=torch.long)
+
+    with torch.no_grad():
+        data_emb = model.composite_emb.data_emb.weight.detach()
+        if repr_mode == 'raw':
+            emb = data_emb[token_ids]
+        elif repr_mode == 'projected_data_only':
+            n_embd = data_emb.shape[1]
+            proj_weight = model.composite_emb.proj.weight.detach()
+            proj_data = proj_weight[:, :n_embd]
+            emb = data_emb[token_ids] @ proj_data.T
+        elif repr_mode == 'projected_fixed_context':
+            shift_dummy = torch.full_like(token_ids, int(neutral_shift))
+            total_dummy = torch.full_like(token_ids, int(neutral_total))
+            emb = model.composite_emb(token_ids, shift_dummy, total_dummy)
+        else:
+            raise ValueError(
+                f"Unknown repr_mode={repr_mode!r}. "
+                "Choose from {'raw', 'projected_data_only', 'projected_fixed_context'}."
+            )
+
+    print(f"[INFO] Representation mode: {repr_mode}")
+    return emb.detach().cpu().numpy(), valid_ids, token_offset
 
 
 # =============================================================================
@@ -127,7 +180,8 @@ def run_umap(embeddings, n_neighbors=15, min_dist=0.1, metric='cosine'):
 def draw_umap_plot(embedding_2d, valid_token_ids, token_meta,
                    token_counts, legend_info,
                    target_label_ids=None, size_levels=None,
-                   figsize=(8, 6), save_path=None):
+                   figsize=(8, 6), save_path=None,
+                   min_event_count=0):
     """
     Render a UMAP scatter plot.
 
@@ -135,6 +189,8 @@ def draw_umap_plot(embedding_2d, valid_token_ids, token_meta,
     ----------
     save_path : str, optional
         If given, save figure to this path (in addition to returning it).
+    min_event_count : int, default 0
+        Hide tokens whose event count is below this threshold.
 
     Returns
     -------
@@ -149,10 +205,15 @@ def draw_umap_plot(embedding_2d, valid_token_ids, token_meta,
     df['token_id'] = valid_token_ids
     df['color'] = [token_meta[t]['color'] for t in valid_token_ids]
     df['name'] = [token_meta[t]['name'] for t in valid_token_ids]
+    df['count'] = [token_counts.get(t, 0) for t in valid_token_ids]
+
+    if min_event_count and min_event_count > 0:
+        n_before = len(df)
+        df = df[df['count'] >= min_event_count].copy()
+        print(f"[INFO] Kept {len(df)}/{n_before} tokens with count >= {min_event_count}")
 
     sizes = []
-    for t in valid_token_ids:
-        c = token_counts.get(t, 0)
+    for c in df['count']:
         if c < size_levels['Low']['thresh']:
             sizes.append(size_levels['Low']['size'])
         elif c < size_levels['Mid']['thresh']:
