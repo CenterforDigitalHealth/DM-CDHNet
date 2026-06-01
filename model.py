@@ -271,14 +271,33 @@ class GroupedQueryAttention(nn.Module):
             v = v.unsqueeze(2).repeat(1, 1, n_rep, 1, 1).reshape(B, self.n_head, T, self.head_dim)
         
         # Compute attention
-        if self.flash and attn_mask is None:
-            # Use Flash Attention
-            y = torch.nn.functional.scaled_dot_product_attention(
-                q, k, v, 
-                attn_mask=None, 
-                dropout_p=self.dropout if self.training else 0.0,
-                is_causal=True
-            )
+        if self.flash:
+            # SDPA path. Folds sliding-window + supplied attn_mask into a single
+            # boolean mask so we never materialise the (B, H, T, T) softmax tensor.
+            if attn_mask is None and self.sliding_window <= 0:
+                y = torch.nn.functional.scaled_dot_product_attention(
+                    q, k, v,
+                    attn_mask=None,
+                    dropout_p=self.dropout if self.training else 0.0,
+                    is_causal=True,
+                )
+            else:
+                if attn_mask is None:
+                    full_mask = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool)).view(1, 1, T, T)
+                else:
+                    full_mask = attn_mask.to(torch.bool)
+                if self.sliding_window > 0:
+                    win_drop = torch.tril(
+                        torch.ones(T, T, device=x.device, dtype=torch.bool),
+                        diagonal=-self.sliding_window,
+                    ).view(1, 1, T, T)
+                    full_mask = full_mask & ~win_drop
+                y = torch.nn.functional.scaled_dot_product_attention(
+                    q, k, v,
+                    attn_mask=full_mask,
+                    dropout_p=self.dropout if self.training else 0.0,
+                    is_causal=False,
+                )
             att = None
         else:
             # Manual attention with custom mask
@@ -325,6 +344,15 @@ class SwiGLUExpert(nn.Module):
         return x
 
 
+def make_gelu_expert(n_embd, intermediate_size, bias):
+    """Legacy MoE expert layout used by older high-AUC checkpoints."""
+    return nn.Sequential(
+        nn.Linear(n_embd, 2 * intermediate_size, bias=bias),
+        nn.GELU(),
+        nn.Linear(2 * intermediate_size, n_embd, bias=bias),
+    )
+
+
 class MixtureOfExperts(nn.Module):
     """Lightweight MoE with SwiGLU experts for domain-specific medical knowledge"""
 
@@ -334,71 +362,69 @@ class MixtureOfExperts(nn.Module):
         self.experts_per_token = config.experts_per_token if hasattr(config, 'experts_per_token') else 2
         self.n_embd = config.n_embd
         self.intermediate_size = 2 * config.n_embd
+        self.expert_type = str(getattr(config, 'moe_expert_type', 'swiglu')).lower()
 
         # Router
         self.gate = nn.Linear(config.n_embd, self.num_experts, bias=False)
 
         # SwiGLU experts
-        self.experts = nn.ModuleList([
-            SwiGLUExpert(config.n_embd, self.intermediate_size, config.bias, config.dropout)
-            for _ in range(self.num_experts)
-        ])
+        if self.expert_type == 'gelu':
+            self.experts = nn.ModuleList([
+                make_gelu_expert(config.n_embd, self.intermediate_size, config.bias)
+                for _ in range(self.num_experts)
+            ])
+        else:
+            self.experts = nn.ModuleList([
+                SwiGLUExpert(config.n_embd, self.intermediate_size, config.bias, config.dropout)
+                for _ in range(self.num_experts)
+            ])
 
     def forward(self, x):
         B, T, C = x.shape
-        
-        # Route tokens to experts
-        router_logits = self.gate(x)  # (B, T, num_experts)
-        router_probs = F.softmax(router_logits, dim=-1)
-        
-        # Select top-k experts
-        routing_weights, selected_experts = torch.topk(
-            router_probs, self.experts_per_token, dim=-1
-        )
-        routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)  # Normalize
-        
-        # ============================================================
+        N = B * T
+
+        # Route tokens — topk on logits, then softmax over selected k (Mixtral style)
+        x_flat = x.view(N, C)
+        router_logits = self.gate(x_flat)                                     # (N, E)
+        router_probs = F.softmax(router_logits, dim=-1)                       # (N, E) — reused for aux loss
+        top_logits, selected_experts = torch.topk(
+            router_logits, self.experts_per_token, dim=-1
+        )  # (N, k)
+        routing_weights = F.softmax(top_logits, dim=-1)                       # (N, k)
+
         # Load Balancing Auxiliary Loss (Switch Transformer style)
-        # Encourages uniform expert utilization
-        # L_aux = N * Σ(f_i * P_i)
-        #   f_i = fraction of tokens routed to expert i (hard assignment)
-        #   P_i = mean routing probability for expert i (soft assignment)
-        # ============================================================
+        # L_aux = num_experts * Σ(f_i * P_i)
+        #   f_i = fraction of tokens routed to expert i (hard, no grad)
+        #   P_i = mean routing probability for expert i (soft, differentiable)
         with torch.no_grad():
-            # f_i: fraction of tokens dispatched to each expert
-            one_hot = F.one_hot(selected_experts, self.num_experts).float()  # (B, T, k, num_experts)
-            f = one_hot.sum(dim=(0, 1, 2)) / (B * T * self.experts_per_token)  # (num_experts,)
-        
-        P = router_probs.mean(dim=(0, 1))  # (num_experts,) - differentiable
+            one_hot = F.one_hot(selected_experts, self.num_experts).float()  # (N, k, E)
+            f = one_hot.sum(dim=(0, 1)) / (N * self.experts_per_token)       # (E,)
+        P = router_probs.mean(dim=0)                                          # (E,) - differentiable
         aux_loss = self.num_experts * (f * P).sum()
-        
-        # Compute expert outputs
-        final_output = torch.zeros_like(x)
-        
-        # Process each expert
+
+        # Token-batching dispatch: flat scatter_add_ — no temporary (B,T,C) allocations
+        final_output = torch.zeros(N, C, device=x.device, dtype=x.dtype)
+
         for i in range(self.num_experts):
-            # Find all tokens that selected this expert at any position
-            expert_mask = (selected_experts == i).any(dim=-1)  # (B, T)
-            
-            if not expert_mask.any():
+            # Positions (in the flat N dim) where expert i appears in any k slot
+            mask = (selected_experts == i)          # (N, k)
+            token_idx = mask.any(dim=-1).nonzero(as_tuple=True)[0]  # (n_i,)
+            if token_idx.numel() == 0:
                 continue
-            
-            # Process all tokens that use this expert
-            expert_input = x[expert_mask]  # (N, C) where N = expert_mask.sum()
-            expert_output = self.experts[i](expert_input)  # (N, C)
-            
-            # Create a mapping to put expert_output back in the right places
-            expert_output_full = torch.zeros_like(x)  # (B, T, C)
-            expert_output_full[expert_mask] = expert_output
-            
-            # For each expert position k, add weighted contribution
+
+            expert_out = self.experts[i](x_flat[token_idx])  # (n_i, C) — single forward pass
+
+            # Accumulate weighted contribution for each k slot
             for k in range(self.experts_per_token):
-                token_mask = (selected_experts[..., k] == i)  # (B, T)
-                if token_mask.any():
-                    weights = routing_weights[..., k:k+1]  # (B, T, 1)
-                    final_output += weights * expert_output_full * token_mask.unsqueeze(-1)
-        
-        return final_output, aux_loss
+                k_sel = mask[token_idx, k]           # (n_i,) bool — which of n_i tokens chose expert i at slot k
+                if not k_sel.any():
+                    continue
+                idx_k = token_idx[k_sel]             # flat token positions
+                w = routing_weights[idx_k, k, None]  # (m, 1)
+                contrib = (expert_out[k_sel] * w).to(dtype=final_output.dtype)
+                final_output.scatter_add_(0, idx_k[:, None].expand(-1, C), contrib)
+
+        return final_output.view(B, T, C), aux_loss
 
 
 class TransformerFFN(nn.Module):
@@ -484,6 +510,16 @@ class CompositeEmbedding(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.n_embd = config.n_embd
+        required_shift_vocab_size = 4
+        if getattr(config, 'separate_shift_na_from_padding', False):
+            required_shift_vocab_size = 6 if getattr(config, 'apply_token_shift', False) else 5
+        if config.shift_vocab_size < required_shift_vocab_size:
+            raise ValueError(
+                "shift_vocab_size is too small for the configured SHIFT token space: "
+                f"got {config.shift_vocab_size}, need at least {required_shift_vocab_size} "
+                f"(apply_token_shift={getattr(config, 'apply_token_shift', False)}, "
+                f"separate_shift_na_from_padding={getattr(config, 'separate_shift_na_from_padding', False)})."
+            )
         
         # 각 필드별 Embedding
         self.data_emb = nn.Embedding(config.data_vocab_size, config.n_embd)
@@ -526,11 +562,13 @@ class MixtureDensityHead(nn.Module):
     Mixture of Logistics head for multi-modal TOTAL distribution.
     """
 
-    def __init__(self, n_embd: int, n_components: int, min_value: float, max_value: float):
+    def __init__(self, n_embd: int, n_components: int, min_value: float, max_value: float,
+                 log_s_min: float = -1.0):
         super().__init__()
         self.n_components = int(n_components)
         self.min_value = float(min_value)
         self.max_value = float(max_value)
+        self.log_s_min = float(log_s_min)
 
         self.proj = nn.Sequential(
             nn.Linear(n_embd, n_embd),
@@ -567,7 +605,7 @@ class MixtureDensityHead(nn.Module):
         # Keep means in valid TOTAL range
         mu = torch.sigmoid(mu_raw) * (self.max_value - self.min_value) + self.min_value
         # Prevent degenerate ultra-narrow components
-        log_s = torch.clamp(log_s, min=-1.0, max=5.0)
+        log_s = torch.clamp(log_s, min=self.log_s_min, max=5.0)
         # Backward-compatible point estimate
         pi = F.softmax(pi_logits, dim=-1)
         mean = (pi * mu).sum(dim=-1)
@@ -622,6 +660,7 @@ class MultiHeadOutput(nn.Module):
         self.mdn_n_components = int(getattr(config, 'mdn_n_components', 8))
         self.total_min_value = float(getattr(config, 'total_min_value', 0.0))
         self.total_max_value = float(getattr(config, 'total_max_value', 550.0))
+        self.mdn_log_s_min = float(getattr(config, 'mdn_log_s_min', -1.0))
         
         # Drug-conditioning option
         self.use_drug_conditioning = getattr(config, 'use_drug_conditioning', False)
@@ -643,6 +682,7 @@ class MultiHeadOutput(nn.Module):
             n_components=self.mdn_n_components,
             min_value=self.total_min_value,
             max_value=self.total_max_value,
+            log_s_min=self.mdn_log_s_min,
         )
 
         # ============================================================
@@ -682,6 +722,7 @@ class MultiHeadOutput(nn.Module):
                 n_components=self.mdn_n_components,
                 min_value=self.total_min_value,
                 max_value=self.total_max_value,
+                log_s_min=self.mdn_log_s_min,
             )
             # Provisional identity init here; reapplied after parent model init.
             self.reset_film_identity()
@@ -828,8 +869,15 @@ class CompositeDelphiConfig:
     # Medical specific
     t_min: float = 0.1
     mask_ties: bool = True
-    ignore_tokens: list = field(default_factory=lambda: [0])
-    
+    # Raw DATA tokens 0-21 are technical/static covariates (padding, no-event,
+    # sex, lifestyle/vitals); the first disease code starts at raw index 22.
+    ignore_tokens: list = field(default_factory=lambda: list(range(22)))
+    # End-of-trajectory (censoring) token. None disables the feature. When set,
+    # it is excluded from the DATA cross-entropy (its position reflects the data
+    # extraction date, not biology) but kept in the time-to-event loss so it
+    # anchors the censoring boundary.
+    eot_token: int = None
+
     # Drug-Conditioning via FiLM (Feature-wise Linear Modulation)
     use_drug_conditioning: bool = True
     film_dropout: float = 0.0
@@ -847,6 +895,7 @@ class CompositeDelphiConfig:
     use_moe: bool = True
     num_experts: int = 4
     experts_per_token: int = 2
+    moe_expert_type: str = 'swiglu'
     sliding_window: int = 512
     rope_theta: float = 10000.0
 
@@ -857,6 +906,7 @@ class CompositeDelphiConfig:
 
     # TOTAL MDN options
     mdn_n_components: int = 8
+    mdn_log_s_min: float = -1.0
     total_min_value: float = 0.0
     total_max_value: float = 550.0
     total_log_transform: bool = False
@@ -872,6 +922,10 @@ class CompositeDelphiConfig:
 
     # DATA head label smoothing (improves calibration → AUC)
     data_label_smoothing: float = 0.0
+    data_loss_static_weight: float = 1.0
+    data_loss_disease_weight: float = 1.0
+    data_loss_drug_weight: float = 1.0
+    tie_data_head: bool = True
 
     # Loss weights (used when use_uncertainty_weighting=False)
     loss_weight_data: float = 1.0
@@ -925,7 +979,8 @@ class CompositeDelphi(nn.Module):
         self.multi_head = MultiHeadOutput(config)
         
         # Weight tying: data_head와 data_emb
-        self.multi_head.data_head.weight = self.composite_emb.data_emb.weight
+        if getattr(config, 'tie_data_head', True):
+            self.multi_head.data_head.weight = self.composite_emb.data_emb.weight
         
         # Uncertainty-weighted multi-task learning (Kendall 2018)
         if getattr(config, 'use_uncertainty_weighting', False):
@@ -966,7 +1021,7 @@ class CompositeDelphi(nn.Module):
     def forward(self, data, shift, total, age,
                 targets_data=None, targets_shift=None, targets_total=None,
                 targets_age=None, drug_conditioning_data=None,
-                validation_loss_mode=False):
+                validation_loss_mode=False, return_attention=None):
         """
         Args:
             data: (B, T) DATA tokens
@@ -974,6 +1029,7 @@ class CompositeDelphi(nn.Module):
             total: (B, T) TOTAL tokens
             age: (B, T) AGE values
             targets_*: 각 필드의 타겟 (optional)
+            return_attention: None이면 기존 동작을 유지하고, bool이면 attention 반환 여부를 강제
         """
         device = data.device
         b, t = data.size()
@@ -1024,14 +1080,14 @@ class CompositeDelphi(nn.Module):
                 drug_token_mask = (targets_data >= drug_token_min) & (targets_data <= drug_token_max)
 
         # 6. Transformer blocks
-        # Skip attention weight collection during training to save ~13GB+ GPU memory
-        is_training = targets_data is not None
+        # Large eval runs do not need full attention tensors unless explicitly requested.
+        collect_attention = (targets_data is None) if return_attention is None else bool(return_attention)
         att_list = []
         aux_losses = []
         for block in self.h:
             x, att, aux_loss = block(x, age, attn_mask,
                                      drug_emb=drug_emb, drug_token_mask=drug_token_mask)
-            if not is_training:
+            if collect_attention:
                 att_list.append(att)
             if aux_loss is not None:
                 aux_losses.append(aux_loss)
@@ -1040,7 +1096,7 @@ class CompositeDelphi(nn.Module):
         moe_aux_loss = sum(aux_losses) / max(len(aux_losses), 1) if aux_losses else None
 
         x = self.ln_f(x)
-        att = torch.stack(att_list) if (att_list and att_list[0] is not None) else None
+        att = torch.stack(att_list) if (collect_attention and att_list and att_list[0] is not None) else None
 
         # 7. Multi-Head Output
         logits = self.multi_head(x, drug_emb=drug_emb, drug_token_mask=drug_token_mask)
@@ -1075,7 +1131,16 @@ class CompositeDelphi(nn.Module):
         pass_tokens = targets_flat != -1
         for k in ignored_tokens:
             pass_tokens = pass_tokens * (targets_flat != k)
-        
+
+        # DATA head must not learn to predict the censoring token (its position
+        # depends on the extraction date). Time/total losses keep these
+        # positions so the last real event -> EOT interval trains hazard.
+        eot_token = getattr(self.config, 'eot_token', None)
+        if eot_token is not None:
+            data_pass_tokens = pass_tokens * (targets_flat != eot_token)
+        else:
+            data_pass_tokens = pass_tokens
+
         # Clamp targets to valid vocab range (defensive measure)
         data_vocab_size = self.config.data_vocab_size
         targets_flat_clamped = torch.clamp(targets_flat, min=0, max=data_vocab_size - 1)
@@ -1092,12 +1157,33 @@ class CompositeDelphi(nn.Module):
         if validation_loss_mode:
             data_label_smoothing = 0.0
 
-        loss_data = F.cross_entropy(
-            data_logits.reshape(-1, data_logits.size(-1))[pass_tokens],
-            targets_flat_clamped[pass_tokens],  # ← clamp된 값 사용
+        data_logits_selected = data_logits.reshape(-1, data_logits.size(-1))[data_pass_tokens]
+        data_targets_selected = targets_flat_clamped[data_pass_tokens]
+        loss_data_each = F.cross_entropy(
+            data_logits_selected,
+            data_targets_selected,
             ignore_index=-1,
             label_smoothing=data_label_smoothing,
+            reduction='none',
         )
+        data_weights = torch.ones_like(loss_data_each)
+        static_w = float(getattr(self.config, 'data_loss_static_weight', 1.0))
+        disease_w = float(getattr(self.config, 'data_loss_disease_weight', 1.0))
+        drug_w = float(getattr(self.config, 'data_loss_drug_weight', 1.0))
+        if static_w != 1.0 or disease_w != 1.0 or drug_w != 1.0:
+            token_ids = targets_flat[data_pass_tokens]
+            offset = 1 if getattr(self.config, 'apply_token_shift', False) else 0
+            disease_min = 22 + offset
+            drug_token_min = getattr(self.config, 'drug_token_min', 1278)
+            drug_token_max = getattr(self.config, 'drug_token_max', 1288)
+
+            static_mask = (token_ids > 0) & (token_ids < disease_min)
+            disease_mask = (token_ids >= disease_min) & (token_ids < drug_token_min)
+            drug_mask = (token_ids >= drug_token_min) & (token_ids <= drug_token_max)
+            data_weights = torch.where(static_mask, data_weights * static_w, data_weights)
+            data_weights = torch.where(disease_mask, data_weights * disease_w, data_weights)
+            data_weights = torch.where(drug_mask, data_weights * drug_w, data_weights)
+        loss_data = (loss_data_each * data_weights).sum() / data_weights.sum().clamp_min(1.0)
         
         # 2. SHIFT Loss (3-class: decrease / maintain / increase)
         shift_logits_source = logits['shift']
@@ -1357,7 +1443,7 @@ class CompositeDelphi(nn.Module):
                     # Any other weight parameter defaults to decay
                     decay.add(fpn)
         
-        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
         
         # Handle weight tying: multi_head.data_head.weight is tied to composite_emb.data_emb.weight (Embedding)
         # The actual parameter is composite_emb.data_emb.weight, which is already in no_decay (Embedding)
@@ -1405,6 +1491,8 @@ class CompositeDelphi(nn.Module):
             {"params": [param_dict[pn] for pn in decay_filtered], "weight_decay": weight_decay},
             {"params": [param_dict[pn] for pn in no_decay_filtered], "weight_decay": 0.0},
         ]
+        if not any(group["params"] for group in optim_groups):
+            raise ValueError("No trainable parameters found for optimizer configuration")
         
         use_fused = (device_type == 'cuda') and ('fused' in inspect.signature(torch.optim.AdamW).parameters)
         if _is_master():
@@ -1415,21 +1503,39 @@ class CompositeDelphi(nn.Module):
         return optimizer
     
     @torch.no_grad()
-    def generate(self, data, shift, total, age, 
+    def generate(self, data, shift, total, age,
                  max_new_tokens=100, max_age=85*365.25,
-                 no_repeat=True, termination_tokens=None):
+                 no_repeat=True, termination_tokens=None,
+                 temperature=1.0, top_k=None, forbidden_tokens=None,
+                 time_scale=1.0):
         """Generate composite sequences"""
         if termination_tokens is None:
             warnings.warn('Consider setting termination_tokens for your dataset.')
             termination_tokens = [1269]
         
         termination_tokens = torch.tensor(termination_tokens, dtype=torch.int64, device=data.device)
+        forbidden_token_ids = set()
+        if forbidden_tokens is not None:
+            forbidden_token_ids.update(int(t) for t in forbidden_tokens if t is not None)
         
         if max_new_tokens == -1:
             max_new_tokens = 128
+
+        time_scale = float(time_scale)
+        if not math.isfinite(time_scale) or time_scale <= 0:
+            raise ValueError(f"time_scale must be a positive finite value, got {time_scale!r}")
         
         for _ in range(max_new_tokens):
-            logits, _, _ = self(data, shift, total, age, drug_conditioning_data=data)
+            # Generation does not consume attention tensors; disabling them
+            # avoids quadratic memory growth during long autoregressive rollout.
+            logits, _, _ = self(
+                data,
+                shift,
+                total,
+                age,
+                drug_conditioning_data=data,
+                return_attention=False,
+            )
             
             # Get last position logits
             data_logits = logits['data'][:, -1, :]
@@ -1448,43 +1554,74 @@ class CompositeDelphi(nn.Module):
                 total_mdn_drug = logits['total_mdn_drug_cond']
             time_logits = logits['time'][:, -1, :]
             
-            # Mask ignored tokens
-            data_logits[:, self.config.ignore_tokens] = -torch.inf
+            # Mask ignored/forbidden tokens on both DATA logits and the
+            # competing-risk time logits. DATA logits choose the event identity;
+            # time logits choose the interval to the next event.
+            vocab_size = time_logits.size(-1)
+            mask_token_ids = set(
+                int(t) for t in getattr(self.config, 'ignore_tokens', [])
+                if 0 <= int(t) < vocab_size
+            )
+            mask_token_ids.update(t for t in forbidden_token_ids if 0 <= t < vocab_size)
+            if mask_token_ids:
+                mask_idx = torch.tensor(sorted(mask_token_ids), dtype=torch.long, device=data.device)
+                data_logits[:, mask_idx] = -torch.inf
+                time_logits[:, mask_idx] = -torch.inf
             
             if no_repeat:
                 fill = data.clone()
-                fill[fill == 1] = 0
+                fill[(fill < 0) | (fill >= vocab_size)] = 0
                 data_logits = data_logits.scatter_(1, fill, -torch.inf)
-            
-            # Sample next tokens from configured time distribution
+                time_logits = time_logits.scatter_(1, fill, -torch.inf)
+
+            # Temperature / top-k applied to DATA logits for event identity.
+            # The time head is trained as an aggregate next-event hazard, so it
+            # should not determine which token is emitted.
+            sample_logits = data_logits
+            if temperature is not None and float(temperature) != 1.0:
+                sample_logits = sample_logits / float(temperature)
+            if top_k is not None and int(top_k) > 0 and int(top_k) < sample_logits.shape[-1]:
+                kth = torch.topk(sample_logits, int(top_k), dim=-1).values[..., -1:]
+                sample_logits = torch.where(sample_logits < kth, torch.full_like(sample_logits, -1e30), sample_logits)
+
+            data_probs = F.softmax(sample_logits, dim=-1)
+            data_next = torch.multinomial(data_probs, num_samples=1)
+
+            # Sample next-event interval from the configured time distribution.
+            # For the exponential branch this mirrors the training loss, which
+            # supervises the aggregate log-hazard via logsumexp(time_logits).
             time_distribution = getattr(self.config, 'time_distribution', 'exponential')
             if time_distribution == 'weibull' and 'time_shape' in logits:
                 # Weibull competing risks:
                 # T_i = (-log U / lambda_i)^(1/k), lambda_i = exp(time_logit_i)
                 # Use shared k (weighted average) to stay aligned with training loss.
                 time_shape_logits = logits['time_shape'][:, -1, :]  # (B, V), already positive
-                event_probs = F.softmax(time_logits, dim=-1)
+                event_log_probs = F.log_softmax(time_logits, dim=-1)
+                event_probs = torch.exp(event_log_probs)
                 shape = torch.clamp((event_probs * time_shape_logits).sum(-1, keepdim=True), min=0.2, max=5.0)  # (B, 1)
 
                 t_min = float(getattr(self.config, 't_min', 0.1))
                 t_min = max(t_min, 1e-8)
                 log_t_min = math.log(t_min)
                 log_lambda_i = time_logits - F.softplus(time_logits + log_t_min)
-                lambda_i = torch.exp(torch.clamp(log_lambda_i, min=-20.0, max=20.0))  # (B, V)
-                u = torch.rand_like(time_logits).clamp_min(1e-12)
-                w = -torch.log(u) / torch.clamp(lambda_i, min=1e-8)
+                log_lambda = torch.logsumexp(event_log_probs + log_lambda_i, dim=-1, keepdim=True)
+                lambda_next = torch.exp(torch.clamp(log_lambda, min=-20.0, max=20.0))  # (B, 1)
+                u = torch.rand_like(lambda_next).clamp_min(1e-12)
+                w = -torch.log(u) / torch.clamp(lambda_next, min=1e-8)
                 sampled_t_years = torch.pow(torch.clamp(w, min=1e-12), 1.0 / shape)
                 sampled_t_days = sampled_t_years * 365.25
-                t_next = torch.clamp(sampled_t_days, min=0.0, max=365 * 80).min(1)
+                t_next_days = torch.clamp(sampled_t_days, min=0.0, max=365 * 80)
             else:
-                # Exponential competing risks (original Delphi behavior)
-                t_next = torch.clamp(
-                    -torch.exp(-time_logits) * torch.rand(time_logits.shape, device=data.device).log(),
-                    min=0, max=365*80
-                ).min(1)
-            
-            data_next = t_next[1][:, None]
-            age_next = age[..., [-1]] + t_next[0][:, None]
+                # Exponential aggregate next-event hazard.
+                lse = torch.logsumexp(time_logits, dim=-1, keepdim=True)
+                log_rate = -torch.log(torch.exp(-lse) + self.config.t_min)
+                u = torch.rand_like(log_rate).clamp_min(1e-12)
+                t_next_days = torch.clamp(-torch.exp(-log_rate) * torch.log(u), min=0, max=365*80)
+
+            if time_scale != 1.0:
+                t_next_days = torch.clamp(t_next_days * time_scale, min=0, max=365*80)
+
+            age_next = age[..., [-1]] + t_next_days
 
             # Use drug-conditioned SHIFT/TOTAL only when next DATA token is a drug.
             shift_logits = shift_logits_base

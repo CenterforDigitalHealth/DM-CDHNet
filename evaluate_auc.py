@@ -2,9 +2,11 @@ import scipy.stats
 import scipy
 import warnings
 import torch
+import json
+import re
 # Suppress sklearn warnings about classes not in y_true
 warnings.filterwarnings('ignore', category=UserWarning, module='sklearn.metrics._classification')
-from model_v4 import CompositeDelphi, CompositeDelphiConfig
+from model import CompositeDelphi, CompositeDelphiConfig
 from tqdm import tqdm
 import pandas as pd
 import numpy as np
@@ -66,11 +68,164 @@ def remap_shift_to_binary_change_torch(shift_values, apply_token_shift):
 def auc(x1, x2):
     n1 = len(x1)
     n2 = len(x2)
-    R1 = np.concatenate([x1, x2]).argsort().argsort()[:n1].sum() + n1
-    U1 = n1 * n2 + 0.5 * n1 * (n1 + 1) - R1
     if n1 == 0 or n2 == 0:
         return np.nan
+    R1 = np.concatenate([x1, x2]).argsort().argsort()[:n1].sum() + n1
+    U1 = R1 - 0.5 * n1 * (n1 + 1)
     return U1 / n1 / n2
+
+
+# Raw DATA token IDs 0–21: padding, no-event, sex, lifestyle / vitals (through Fasting Glucose high).
+# First ICD-10 disease code (A00) is raw index 22 (see labels_chapter.csv token_id).
+MIN_DISEASE_RAW_TOKEN_INDEX = 22
+DATA_ONLY_EXTVAL_PREFIXES = {"extval_ukb", "extval_ckb"}
+DIABETES_DIAGNOSIS_RAW_TOKEN_INDICES = {223, 224, 225, 226, 227}  # E10-E14
+CKB_DIABETES_CODEBOOK_GROUP_ID = 14
+CKB_MALIGNANT_NEOPLASMS_CODEBOOK_GROUP_ID = 20
+
+
+CKB_CODEBOOK_GROUP_SPECS = [
+    {"id": 1, "name": "Hypertension", "codes": ["I10", "I11", "I12", "I13", "I15"]},
+    {"id": 2, "name": "Coronary heart disease", "codes": ["I20", "I21", "I22", "I23", "I24", "I25"]},
+    {"id": 3, "name": "Acute myocardial infarction", "codes": ["I21", "I22"]},
+    {"id": 4, "name": "Angina pectoris", "codes": ["I20"]},
+    {"id": 5, "name": "Other ischaemic heart disease", "codes": ["I24", "I25"]},
+    {"id": 6, "name": "Rheumatic heart disease", "codes": ["I05", "I06", "I07", "I08", "I09"]},
+    {"id": 7, "name": "Pulmonary heart disease", "codes": ["I26", "I27", "I28"]},
+    {"id": 8, "name": "Stroke or TIA", "codes": ["I60", "I61", "I63", "I64", "G45"]},
+    {"id": 9, "name": "Asthma", "codes": ["J45", "J46"]},
+    {"id": 10, "name": "COPD", "codes": ["J41", "J42", "J43", "J44"]},
+    {"id": 11, "name": "Emphysema/Bronchitis", "codes": ["J43", "J41", "J42"]},
+    {"id": 12, "name": "Emphysema", "codes": ["J43"]},
+    {"id": 13, "name": "Chronic bronchitis", "codes": ["J41", "J42"]},
+    {"id": 14, "name": "Diabetes mellitus", "codes": ["E10", "E11", "E12", "E13", "E14"]},
+    {"id": 15, "name": "Osteoporosis", "codes": ["M80", "M81"]},
+    {"id": 16, "name": "Cirrhosis/Chronic hepatitis", "codes": ["K70", "K71", "K72", "K73", "K74"]},
+    {"id": 17, "name": "Gallstone/Gallbladder disease", "codes": ["K80", "K81", "K82"]},
+    {"id": 18, "name": "Peptic ulcer", "codes": ["K25", "K26", "K27", "K28"]},
+    {"id": 19, "name": "Kidney disease", "codes": ["N00", "N03", "N04", "N05", "N07", "N11", "N18"]},
+    {"id": 20, "name": "Malignant neoplasms", "codes": ["C00-C97"]},
+    {"id": 21, "name": "Rheumatoid arthritis", "codes": ["M05", "M06"]},
+    {"id": 22, "name": "Fracture", "codes": ["S02", "S12", "S22", "S32", "S42", "S52", "S62", "S72", "S82", "S92"]},
+    {"id": 23, "name": "Head injury", "codes": ["S00", "S01", "S02", "S06", "S09"]},
+    {"id": 24, "name": "Tuberculosis", "codes": ["A15", "A16", "A17", "A18", "A19"]},
+    {"id": 25, "name": "Neurasthenia", "codes": ["F48"]},
+    {"id": 26, "name": "Psychiatric disorder", "codes": ["F20-F29", "F30-F39"]},
+    {"id": 27, "name": "Depression", "codes": ["F32", "F33"]},
+    {"id": 28, "name": "Anxiety disorder", "codes": ["F40", "F41"]},
+    {"id": 29, "name": "Other psychiatric disorders", "codes": ["F99"]},
+    {"id": 30, "name": "Suspected suicide & self-harm", "codes": ["T50.9", "T58", "T59", "W13-W19", "W65"]},
+    # Codebook row 31 is non-vascular mortality and has no DATA ICD-10 token target.
+    {"id": 32, "name": "Any cerebrovascular disease", "codes": ["I60", "I61", "I62", "I63", "I64", "I65", "I66", "I67", "I68", "I69", "G45", "G46"]},
+    {"id": 33, "name": "Chronic kidney disease", "codes": ["E10.2", "E11.2", "I12", "I13", "N03", "N07", "N11", "N18"]},
+]
+
+
+def normalize_icd10_level3(code, allow_subcode_to_level3=False):
+    """
+    Normalize ICD-10 strings to level-3 model tokens.
+
+    Decimal subcodes such as E11.2 are not broadened by default because mapping
+    them to E11 changes the phenotype definition.
+    """
+    if code is None:
+        return None
+    code = str(code).strip().upper()
+    if "." in code and not allow_subcode_to_level3:
+        return None
+    match = re.match(r"^\s*([A-Z])(\d{2})(?:\.\d+)?\s*$", code)
+    if match is None:
+        return None
+    return f"{match.group(1)}{match.group(2)}"
+
+
+def expand_icd10_level3_specs(code_specs, allow_subcode_to_level3=False):
+    """Expand codebook specs like C00-C97 and F20-F29 to level-3 ICD-10 codes."""
+    expanded = []
+    skipped = []
+    for spec in code_specs:
+        spec = str(spec).strip().upper()
+        if not spec:
+            continue
+        if "-" in spec:
+            left_raw, right_raw = spec.split("-", 1)
+            left = normalize_icd10_level3(left_raw, allow_subcode_to_level3=allow_subcode_to_level3)
+            right = normalize_icd10_level3(right_raw, allow_subcode_to_level3=allow_subcode_to_level3)
+            if left is None or right is None or left[0] != right[0]:
+                skipped.append(spec)
+                continue
+            for number in range(int(left[1:]), int(right[1:]) + 1):
+                expanded.append(f"{left[0]}{number:02d}")
+        else:
+            code = normalize_icd10_level3(spec, allow_subcode_to_level3=allow_subcode_to_level3)
+            if code is not None:
+                expanded.append(code)
+            else:
+                skipped.append(spec)
+    return list(dict.fromkeys(expanded)), skipped
+
+
+def extract_icd10_level3_from_label(label_name):
+    """Extract the leading ICD-10 level-3 code from a labels.csv name."""
+    if label_name is None:
+        return None
+    match = re.match(r"^\s*([A-Z]\d{2})(?:\b|\s|\()", str(label_name).upper())
+    return match.group(1) if match is not None else None
+
+
+def build_icd10_level3_token_map(labels_df, token_offset=0):
+    """Map ICD-10 level-3 codes to DATA token IDs in the current model token space."""
+    if labels_df is None or "index" not in labels_df.columns or "name" not in labels_df.columns:
+        return {}
+
+    code_to_token = {}
+    for _, row in labels_df.iterrows():
+        code = extract_icd10_level3_from_label(row.get("name"))
+        if code is None:
+            continue
+        code_to_token.setdefault(code, int(row["index"]) + int(token_offset))
+    return code_to_token
+
+
+def build_ckb_codebook_group_maps(labels_df, token_offset=0, vocab_size=None):
+    """
+    Build CKB codebook disease groups.
+
+    A group is positive when any target DATA ICD-10 token overlaps the group's code
+    set. Scores are aggregated across the same ICD-10 token set.
+    """
+    code_to_token = build_icd10_level3_token_map(labels_df, token_offset=token_offset)
+    token_sets = {}
+    label_map = {}
+    icd_code_map = {}
+    missing_code_map = {}
+
+    for spec in CKB_CODEBOOK_GROUP_SPECS:
+        group_id = int(spec["id"])
+        codes, skipped_codes = expand_icd10_level3_specs(spec["codes"])
+        tokens = []
+        missing_codes = list(skipped_codes)
+        for code in codes:
+            token = code_to_token.get(code)
+            if token is None:
+                missing_codes.append(code)
+                continue
+            if vocab_size is not None and not (0 <= int(token) < int(vocab_size)):
+                missing_codes.append(code)
+                continue
+            tokens.append(int(token))
+
+        if not tokens:
+            missing_code_map[group_id] = missing_codes or codes
+            continue
+
+        token_sets[group_id] = sorted(set(tokens))
+        label_map[group_id] = spec["name"]
+        icd_code_map[group_id] = ",".join(codes)
+        if missing_codes:
+            missing_code_map[group_id] = missing_codes
+
+    return token_sets, label_map, icd_code_map, missing_code_map
 
 
 def get_common_diseases(labels_df, filter_min_total=100, apply_token_shift=False):
@@ -87,14 +242,22 @@ def get_common_diseases(labels_df, filter_min_total=100, apply_token_shift=False
     Returns:
         List of token IDs as used by the model.
     """
+    idx_col = 'index' if 'index' in labels_df.columns else (
+        'token_id' if 'token_id' in labels_df.columns else None
+    )
+    if idx_col is None:
+        raise ValueError("labels_df must contain 'index' or 'token_id' for disease selection")
+
     if 'count' in labels_df.columns:
         labels_df_filtered = labels_df[labels_df['count'] > filter_min_total]
     else:
-        # If no count column, use all non-special tokens
-        # Assuming tokens 0-20 are special tokens (padding, no event, sex, lifestyle, etc.)
-        labels_df_filtered = labels_df[labels_df['index'] > 20]
+        labels_df_filtered = labels_df
 
-    raw_indices = labels_df_filtered['index'].tolist()
+    labels_df_filtered = labels_df_filtered[
+        labels_df_filtered[idx_col] >= MIN_DISEASE_RAW_TOKEN_INDEX
+    ]
+
+    raw_indices = labels_df_filtered[idx_col].tolist()
     if apply_token_shift:
         return [idx + 1 for idx in raw_indices]
     return raw_indices
@@ -103,6 +266,12 @@ def get_common_diseases(labels_df, filter_min_total=100, apply_token_shift=False
 def get_data_token_offset(apply_token_shift: bool) -> int:
     """Return the DATA-token offset used by the model/tokenizer pipeline."""
     return 1 if apply_token_shift else 0
+
+
+def get_diabetes_diagnosis_tokens(apply_token_shift: bool):
+    """Return E10-E14 DATA token IDs in the current model token space."""
+    offset = get_data_token_offset(apply_token_shift)
+    return {int(tok + offset) for tok in DIABETES_DIAGNOSIS_RAW_TOKEN_INDICES}
 
 
 def build_labels_df_for_merge(labels_df, apply_token_shift: bool):
@@ -138,6 +307,155 @@ def finalize_token_columns(df):
     ordered = [c for c in preferred if c in df.columns]
     ordered += [c for c in df.columns if c not in ordered]
     return df[ordered]
+
+
+def build_age_stratified_auc_summary(df_unpooled: pd.DataFrame) -> pd.DataFrame:
+    """
+    Summarize disease-level AUC by prediction-time age stratum (calendar age at the
+    token position used for prediction, in years — same binning as get_calibration_auc).
+
+    Each row of df_unpooled is one (token, age bin) from get_calibration_auc. This
+    aggregates across diseases to describe the AUC distribution within each age bin.
+
+    Prefers ``auc_delong`` when present; otherwise uses ``auc``. Drops rows with
+    status != 'ok' when ``status`` is present. For bootstrap runs, uses ``bootstrap_idx == 0`` only.
+    """
+    if df_unpooled is None or df_unpooled.empty or "age" not in df_unpooled.columns:
+        return pd.DataFrame()
+
+    work = df_unpooled.copy()
+    if "bootstrap_idx" in work.columns:
+        work = work.loc[work["bootstrap_idx"] == 0]
+    if "status" in work.columns:
+        work = work.loc[work["status"].eq("ok")]
+
+    if "auc_delong" in work.columns and work["auc_delong"].notna().any():
+        auc_col = "auc_delong"
+    elif "auc" in work.columns:
+        auc_col = "auc"
+    else:
+        return pd.DataFrame()
+
+    work[auc_col] = pd.to_numeric(work[auc_col], errors="coerce")
+    work = work.loc[np.isfinite(work[auc_col])]
+    if work.empty:
+        return pd.DataFrame()
+
+    def _agg(group: pd.DataFrame) -> pd.Series:
+        s = group[auc_col]
+        row = {
+            "n_evaluations": int(len(group)),
+            "n_unique_tokens": int(group["token"].nunique()) if "token" in group.columns else np.nan,
+            "auc_mean": float(s.mean()),
+            "auc_median": float(s.median()),
+            "auc_std": float(s.std(ddof=1)) if len(s) > 1 else 0.0,
+            "auc_q25": float(s.quantile(0.25)),
+            "auc_q75": float(s.quantile(0.75)),
+        }
+        if "n_healthy" in group.columns:
+            row["n_healthy_total"] = int(group["n_healthy"].sum())
+        if "n_diseased" in group.columns:
+            row["n_diseased_total"] = int(group["n_diseased"].sum())
+        return pd.Series(row)
+
+    out = work.groupby("age", sort=True).apply(_agg, include_groups=False).reset_index()
+    if out.empty:
+        return out
+    ages_sorted = np.sort(out["age"].to_numpy())
+    if len(ages_sorted) >= 2:
+        step = float(ages_sorted[1] - ages_sorted[0])
+        out["age_bin_years"] = out["age"].apply(lambda a: f"[{a:g}, {a + step:g})")
+    else:
+        out["age_bin_years"] = out["age"].apply(lambda a: f"[{a:g}, ?)")
+    return out
+
+
+def _detect_sex_per_patient(x_data_np, apply_token_shift: bool):
+    """
+    Determine each patient's sex from the input DATA tokens.
+
+    Returns
+    -------
+    sex : np.ndarray of shape (B,)
+        0 = unknown, 1 = female, 2 = male
+    """
+    offset = 1 if apply_token_shift else 0
+    female_tok = 2 + offset
+    male_tok = 3 + offset
+    is_female = (x_data_np == female_tok).any(axis=1)
+    is_male = (x_data_np == male_tok).any(axis=1)
+    sex = np.zeros(x_data_np.shape[0], dtype=np.int8)
+    sex[is_female] = 1
+    sex[is_male] = 2
+    return sex
+
+
+def _filter_data_by_sex(d, p, pred_idx, sex_arr, sex_value):
+    """
+    Subset d (list of 4 arrays), p, and pred_idx to patients with ``sex_arr == sex_value``.
+    Returns (d_sub, p_sub, pred_idx_sub).
+    """
+    mask = sex_arr == sex_value
+    d_sub = [arr[mask] for arr in d]
+    p_sub = p[mask] if p is not None else None
+    pred_sub = pred_idx[mask] if pred_idx is not None else None
+    return d_sub, p_sub, pred_sub
+
+
+def build_sex_stratified_auc_summary(df_unpooled: pd.DataFrame) -> pd.DataFrame:
+    """
+    Summarize disease-level AUC by sex stratum.
+
+    Expects ``df_unpooled`` to contain a ``sex`` column (values: ``'all'``,
+    ``'female'``, ``'male'``).  Groups by ``sex`` (and optionally ``age``) and
+    computes mean / median / std / quartiles of AUC across diseases.
+
+    Returns an empty DataFrame when the ``sex`` column is absent.
+    """
+    if df_unpooled is None or df_unpooled.empty or "sex" not in df_unpooled.columns:
+        return pd.DataFrame()
+
+    work = df_unpooled.copy()
+    if "bootstrap_idx" in work.columns:
+        work = work.loc[work["bootstrap_idx"] == 0]
+    if "status" in work.columns:
+        work = work.loc[work["status"].eq("ok")]
+
+    if "auc_delong" in work.columns and work["auc_delong"].notna().any():
+        auc_col = "auc_delong"
+    elif "auc" in work.columns:
+        auc_col = "auc"
+    else:
+        return pd.DataFrame()
+
+    work[auc_col] = pd.to_numeric(work[auc_col], errors="coerce")
+    work = work.loc[np.isfinite(work[auc_col])]
+    if work.empty:
+        return pd.DataFrame()
+
+    def _agg(group: pd.DataFrame) -> pd.Series:
+        s = group[auc_col]
+        row = {
+            "n_evaluations": int(len(group)),
+            "n_unique_tokens": int(group["token"].nunique()) if "token" in group.columns else np.nan,
+            "auc_mean": float(s.mean()),
+            "auc_median": float(s.median()),
+            "auc_std": float(s.std(ddof=1)) if len(s) > 1 else 0.0,
+            "auc_q25": float(s.quantile(0.25)),
+            "auc_q75": float(s.quantile(0.75)),
+        }
+        if "n_healthy" in group.columns:
+            row["n_healthy_total"] = int(group["n_healthy"].sum())
+        if "n_diseased" in group.columns:
+            row["n_diseased_total"] = int(group["n_diseased"].sum())
+        return pd.Series(row)
+
+    group_cols = ["sex"]
+    if "age" in work.columns:
+        group_cols.append("age")
+
+    out = work.groupby(group_cols, sort=True).apply(_agg, include_groups=False).reset_index()
+    return out
 
 
 def optimized_bootstrapped_auc_gpu(case, control, n_bootstrap=1000):
@@ -328,13 +646,26 @@ def get_auc_delong_var(healthy_scores, diseased_scores):
     return aucs[0], delongcov
 
 
-def get_calibration_auc(j, k, d, p, diseases_chunk, offset=365.25, age_groups=range(45, 80, 5), precomputed_idx=None, n_bootstrap=1, use_delong=False):
+def get_calibration_auc(
+    j,
+    k,
+    d,
+    p,
+    diseases_chunk,
+    offset=365.25,
+    age_groups=range(45, 80, 5),
+    precomputed_idx=None,
+    n_bootstrap=1,
+    use_delong=False,
+    target_tokens=None,
+    exclude_control_tokens=None,
+):
     """
     Compute calibration AUC for a specific disease token.
     
     Args:
         j: index of disease in the chunk
-        k: disease token ID (actual token value)
+        k: disease token ID or synthetic disease-group ID
         d: data tuple [input_tokens, input_ages, target_tokens, target_ages]
         p: predictions (logits) from model, shape (B, T, chunk_size) - only for diseases in chunk
         diseases_chunk: array of disease token IDs in this chunk
@@ -343,22 +674,35 @@ def get_calibration_auc(j, k, d, p, diseases_chunk, offset=365.25, age_groups=ra
         precomputed_idx: precomputed prediction indices
         n_bootstrap: number of bootstrap samples
         use_delong: whether to use DeLong method
+        target_tokens: DATA tokens that count as this disease/group. If None,
+                       defaults to exact match on k.
+        exclude_control_tokens: DATA tokens to exclude from the control pool
+                                without changing case definitions.
     
     Returns:
         list of dictionaries with AUC results (includes N/A results for insufficient data)
     """
     age_step = age_groups[1] - age_groups[0]
+    if target_tokens is None:
+        target_tokens = [k]
+    target_tokens = np.asarray(list(target_tokens), dtype=d[2].dtype)
 
-    # Indexes of cases with disease k
+    # Indexes of cases with disease k, or any DATA token in the disease group.
     # d[2] contains target tokens (disease tokens)
-    wk = np.where(d[2] == k)
+    case_mask = np.isin(d[2], target_tokens)
+    wk = np.where(case_mask)
     n_cases = len(wk[0])
 
-    # For controls, we need to exclude cases with disease k
-    # Controls are positions where the target token is not k
-    # We also exclude patients who have disease k anywhere in their trajectory
-    patient_has_disease = (d[2] == k).any(axis=1)  # (B,) - True if patient has disease k
-    wc = np.where((d[2] != k) & (~patient_has_disease[:, None]))  # Controls: not k and patient doesn't have k
+    # For controls, we need to exclude cases with disease k/group.
+    # Controls are positions where the target token is not in the target set.
+    # We also exclude patients who have the disease/group anywhere in their trajectory.
+    control_mask = ~case_mask
+    if exclude_control_tokens is not None:
+        exclude_control_tokens = np.asarray(list(exclude_control_tokens), dtype=d[2].dtype)
+        if exclude_control_tokens.size > 0:
+            control_mask &= ~np.isin(d[2], exclude_control_tokens)
+    patient_has_disease = case_mask.any(axis=1)  # (B,) - True if patient has disease/group
+    wc = np.where(control_mask & (~patient_has_disease[:, None]))
     n_controls = len(wc[0])
 
     # If insufficient data, return N/A results for all age groups
@@ -372,6 +716,7 @@ def get_calibration_auc(j, k, d, p, diseases_chunk, offset=365.25, age_groups=ra
                 "age": aa,
                 "n_healthy": n_controls if n_controls > 0 else 0,
                 "n_diseased": n_cases,
+                "n_target_tokens": len(target_tokens),
                 "status": reason,
             }
             if use_delong:
@@ -454,6 +799,7 @@ def get_calibration_auc(j, k, d, p, diseases_chunk, offset=365.25, age_groups=ra
                 "age": aa,
                 "n_healthy": len(control),
                 "n_diseased": len(case),
+                "n_target_tokens": len(target_tokens),
                 "status": "ok",
             }
             if n_bootstrap > 1:
@@ -462,7 +808,14 @@ def get_calibration_auc(j, k, d, p, diseases_chunk, offset=365.25, age_groups=ra
     return out
 
 
-def evaluate_composite_fields(model, d100k, batch_size=64, device="mps"):
+def evaluate_composite_fields(
+    model,
+    d100k,
+    batch_size=64,
+    device="mps",
+    raw_output_path=None,
+    raw_output_prefix="composite",
+):
     """
     Evaluate binary CHANGE(from SHIFT), TOTAL predictions for CompositeDelphi model.
     
@@ -471,6 +824,10 @@ def evaluate_composite_fields(model, d100k, batch_size=64, device="mps"):
         d100k: Data batch from get_batch_composite
         batch_size: Batch size for inference
         device: Device identifier
+        raw_output_path: Optional directory for saving per-event SHIFT/TOTAL
+            predictions. These arrays are needed for threshold tuning and
+            regression diagnostic plots.
+        raw_output_prefix: Prefix used for the raw prediction ``.npz`` file.
     
     Returns:
         dict with evaluation metrics for each field
@@ -642,6 +999,33 @@ def evaluate_composite_fields(model, d100k, batch_size=64, device="mps"):
     else:
         all_predictions_total_drug_cond = np.array([])
         all_targets_total_drug_cond = np.array([])
+
+    if raw_output_path is not None:
+        raw_output_path = Path(raw_output_path)
+        raw_output_path.mkdir(parents=True, exist_ok=True)
+        raw_prefix = str(raw_output_prefix or "composite")
+        raw_file = raw_output_path / f"{raw_prefix}_composite_raw_predictions.npz"
+
+        raw_payload = {
+            "schema_version": np.array("composite_raw_predictions_v1"),
+            "shift_target": all_targets["shift"].astype(np.int16, copy=False),
+            "shift_pred": all_predictions["shift"].astype(np.int16, copy=False),
+            "shift_probs": all_shift_probs.astype(np.float32, copy=False),
+            "total_target": all_targets["total"].astype(np.float32, copy=False),
+            "total_pred": all_predictions["total"].astype(np.float32, copy=False),
+            "total_target_pos": all_targets_pos["total"].astype(np.float32, copy=False),
+            "total_pred_pos": all_predictions_pos["total"].astype(np.float32, copy=False),
+            "shift_target_drug_cond": all_targets_shift_drug_cond.astype(np.int16, copy=False),
+            "shift_pred_drug_cond": all_predictions_shift_drug_cond.astype(np.int16, copy=False),
+            "shift_probs_drug_cond": all_shift_probs_drug_cond.astype(np.float32, copy=False),
+            "total_target_drug_cond": all_targets_total_drug_cond.astype(np.float32, copy=False),
+            "total_pred_drug_cond": all_predictions_total_drug_cond.astype(np.float32, copy=False),
+            "drug_token_min": np.array(drug_token_min, dtype=np.int32),
+            "drug_token_max": np.array(drug_token_max, dtype=np.int32),
+            "apply_token_shift": np.array(eval_apply_token_shift, dtype=np.bool_),
+        }
+        np.savez_compressed(raw_file, **raw_payload)
+        print(f"Composite raw predictions saved to {raw_file}")
     
     # Calculate metrics
     results = {}
@@ -786,6 +1170,104 @@ def evaluate_composite_fields(model, d100k, batch_size=64, device="mps"):
     return results
 
 
+def evaluate_next_token_prediction(
+    model,
+    data,
+    p2i,
+    patient_indices,
+    block_size=512,
+    batch_size=64,
+    device="cpu",
+    no_event_token_rate=5,
+    apply_token_shift=False,
+    separate_shift_na_from_padding=False,
+    shift_na_raw_token=4,
+):
+    """
+    Teacher-forced next-token prediction loss on a patient cohort.
+
+    This mirrors train_model.py validation/checkpoint selection: targets are
+    provided to the model and validation_loss_mode masks technical tokens.
+    """
+    model.eval()
+    model.to(device)
+
+    loss_keys = ["loss", "loss_data", "loss_shift", "loss_total", "loss_time"]
+    weighted_loss_sum = np.zeros(len(loss_keys), dtype=np.float64)
+    total_weight = 0
+    total_patients = 0
+    valid_data_targets = 0
+
+    ignored_tokens = set(getattr(model.config, "ignore_tokens", []))
+    ignored_tokens.add(1)
+
+    with torch.no_grad():
+        for start_idx in tqdm(
+            range(0, len(patient_indices), batch_size),
+            desc="Next-token prediction",
+        ):
+            batch_patient_indices = patient_indices[start_idx:start_idx + batch_size]
+            if len(batch_patient_indices) == 0:
+                continue
+
+            batch = get_batch_composite(
+                batch_patient_indices,
+                data,
+                p2i,
+                select="left",
+                block_size=block_size,
+                device=device,
+                padding="random",
+                no_event_token_rate=no_event_token_rate,
+                cut_batch=True,
+                apply_token_shift=apply_token_shift,
+                separate_shift_na_from_padding=separate_shift_na_from_padding,
+                shift_na_raw_token=shift_na_raw_token,
+            )
+            x_data, x_shift, x_total, x_ages, y_data, y_shift, y_total, y_ages = batch
+
+            _, loss, _ = model(
+                x_data,
+                x_shift,
+                x_total,
+                x_ages,
+                targets_data=y_data,
+                targets_shift=y_shift,
+                targets_total=y_total,
+                targets_age=y_ages,
+                validation_loss_mode=True,
+                return_attention=False,
+            )
+
+            target_mask = y_data != -1
+            for token in ignored_tokens:
+                target_mask = target_mask & (y_data != int(token))
+            batch_valid_targets = int(target_mask.sum().item())
+            batch_weight = max(batch_valid_targets, 1)
+
+            weighted_loss_sum += np.array(
+                [float(loss[key].detach().cpu().item()) for key in loss_keys],
+                dtype=np.float64,
+            ) * batch_weight
+            total_weight += batch_weight
+            total_patients += len(batch_patient_indices)
+            valid_data_targets += batch_valid_targets
+
+    if total_weight == 0:
+        raise ValueError("No valid targets found for next-token prediction evaluation")
+
+    averaged = weighted_loss_sum / total_weight
+    return {
+        "next_token_loss": float(averaged[0]),
+        "next_token_loss_data": float(averaged[1]),
+        "next_token_loss_shift": float(averaged[2]),
+        "next_token_loss_total": float(averaged[3]),
+        "next_token_loss_time": float(averaged[4]),
+        "next_token_patients": int(total_patients),
+        "next_token_valid_data_targets": int(valid_data_targets),
+    }
+
+
 # New internal function that performs the AUC evaluation pipeline.
 def evaluate_auc_pipeline(
     model,
@@ -803,8 +1285,19 @@ def evaluate_auc_pipeline(
     device="cpu",
     seed=1337,
     n_bootstrap=1,
+    disease_score_mode="logits",
     meta_info={},
     train_valid_tokens=None,  # Set of tokens present in train data (for filtering)
+    composite_model=None,
+    auc_sex_slices="all,female,male",
+    use_delong=True,
+    disease_token_sets=None,
+    disease_label_map=None,
+    disease_icd_code_map=None,
+    exclude_diseases_of_interest=None,
+    exclude_auc_control_tokens=None,
+    composite_raw_output_path=None,
+    composite_raw_output_prefix=None,
 ):
     """
     Runs the AUC evaluation pipeline.
@@ -824,12 +1317,122 @@ def evaluate_auc_pipeline(
         device (str): Device identifier.
         seed (int): Random seed for reproducibility.
         n_bootstrap (int): Number of bootstrap samples. (1 for no bootstrap)
+        disease_score_mode (str): Disease score for AUC: logits, data_prob, risk, or time_rate.
         meta_info (dict): Additional metadata to add to output DataFrames.
+        use_delong (bool): Whether to compute DeLong AUC variance columns.
+        disease_token_sets (dict[int, list[int]], optional): Maps each evaluation
+            token/group ID to DATA tokens that count as positives. Used for CKB
+            codebook groups where any overlapping ICD-10 token is a case.
+        disease_label_map (dict[int, str], optional): Names for synthetic
+            evaluation groups.
+        disease_icd_code_map (dict[int, str], optional): ICD-10 code lists for
+            synthetic evaluation groups.
+        exclude_diseases_of_interest (set[int], optional): Evaluation token/group
+            IDs to remove, e.g. cohort-defining diabetes targets in DM cohorts.
+        exclude_auc_control_tokens (list[int], optional): DATA tokens to remove
+            from the disease AUC control pool. This is used for pp EOT rows.
+        composite_raw_output_path (str | Path | None): Optional directory where
+            per-event SHIFT/TOTAL raw predictions are written.
+        composite_raw_output_prefix (str | None): Prefix for raw prediction
+            files. Useful when one output directory contains multiple datasets.
     Returns:
-        tuple: (df_auc_unpooled, df_auc, df_both) DataFrames.
+        tuple: (df_auc_unpooled, df_auc_merged, composite_metrics, df_auc_age_stratified).
+        ``df_auc_age_stratified`` aggregates unpooled AUC across diseases per age bin.
     """
 
     assert n_bootstrap > 0, "n_bootstrap must be greater than 0"
+
+    disease_score_mode = str(disease_score_mode).lower()
+    valid_score_modes = {"logits", "data_prob", "risk", "time_rate"}
+    if disease_score_mode not in valid_score_modes:
+        raise ValueError(
+            f"Unsupported disease_score_mode={disease_score_mode!r}. "
+            f"Expected one of {sorted(valid_score_modes)}"
+        )
+    if meta_info is not None:
+        meta_info["disease_score_mode"] = disease_score_mode
+        meta_info["use_delong"] = bool(use_delong)
+    if exclude_auc_control_tokens is None:
+        exclude_auc_control_tokens = []
+    else:
+        exclude_auc_control_tokens = sorted({int(tok) for tok in exclude_auc_control_tokens})
+    if meta_info is not None:
+        meta_info["exclude_auc_control_tokens"] = ",".join(map(str, exclude_auc_control_tokens))
+    if exclude_auc_control_tokens:
+        print(f"AUC controls: excluding DATA target tokens {exclude_auc_control_tokens}")
+    exclude_diseases_of_interest = (
+        set() if exclude_diseases_of_interest is None
+        else {int(tok) for tok in exclude_diseases_of_interest}
+    )
+
+    grouped_disease_targets = disease_token_sets is not None
+    if grouped_disease_targets:
+        disease_token_sets = {
+            int(group_id): sorted({int(tok) for tok in tokens})
+            for group_id, tokens in disease_token_sets.items()
+        }
+        disease_label_map = {} if disease_label_map is None else {
+            int(group_id): str(name) for group_id, name in disease_label_map.items()
+        }
+        disease_icd_code_map = {} if disease_icd_code_map is None else {
+            int(group_id): str(codes) for group_id, codes in disease_icd_code_map.items()
+        }
+
+    def _base_disease_scores(outputs, token_ids):
+        data_logits = outputs["data"]
+        if disease_score_mode == "logits":
+            return data_logits[:, :, token_ids]
+        if disease_score_mode == "data_prob":
+            return torch.softmax(data_logits, dim=-1)[:, :, token_ids]
+
+        time_logits = outputs.get("time_scale", outputs.get("time", None))
+        if time_logits is None:
+            raise RuntimeError(
+                f"disease_score_mode={disease_score_mode!r} requires a time_scale/time head"
+            )
+
+        t_min = float(getattr(model.config, "t_min", 0.1))
+        log_t_min = np.log(max(t_min, 1e-8))
+        if disease_score_mode == "time_rate":
+            log_lambda = time_logits - torch.nn.functional.softplus(time_logits + log_t_min)
+            return torch.exp(torch.clamp(log_lambda[:, :, token_ids], min=-20.0, max=20.0))
+
+        lse = torch.logsumexp(time_logits, dim=-1, keepdim=True)
+        log_lambda_total = lse - torch.nn.functional.softplus(lse + log_t_min)
+        lambda_total = torch.exp(torch.clamp(log_lambda_total, min=-20.0, max=20.0))
+        event_any = 1.0 - torch.exp(-lambda_total * float(offset))
+        data_prob = torch.softmax(data_logits, dim=-1)
+        return data_prob[:, :, token_ids] * event_any
+
+    def _disease_scores(outputs, diseases_chunk):
+        if not grouped_disease_targets:
+            return _base_disease_scores(outputs, diseases_chunk)
+
+        chunk_token_sets = []
+        for group_id in diseases_chunk:
+            tokens = disease_token_sets.get(int(group_id), [])
+            tokens = [int(tok) for tok in tokens if 0 <= int(tok) < vocab_size]
+            if not tokens:
+                raise ValueError(f"No valid DATA target tokens for disease group {group_id}")
+            chunk_token_sets.append(tokens)
+
+        unique_tokens = sorted({tok for tokens in chunk_token_sets for tok in tokens})
+        token_scores = _base_disease_scores(outputs, unique_tokens)
+        token_pos = {tok: i for i, tok in enumerate(unique_tokens)}
+
+        group_scores = []
+        for tokens in chunk_token_sets:
+            idx = [token_pos[tok] for tok in tokens if tok in token_pos]
+            scores = token_scores[:, :, idx]
+            if scores.shape[-1] == 1:
+                group_scores.append(scores[:, :, 0])
+            elif disease_score_mode == "logits":
+                group_scores.append(scores.max(dim=-1).values)
+            else:
+                group_scores.append(scores.sum(dim=-1))
+        return torch.stack(group_scores, dim=-1)
+
+    print(f"Disease score mode: {disease_score_mode}")
 
     # Set random seeds
     torch.manual_seed(seed)
@@ -857,11 +1460,44 @@ def evaluate_auc_pipeline(
     # Get common diseases
     _apply_token_shift = bool(getattr(model.config, 'apply_token_shift', False))
     if diseases_of_interest is None:
+        if grouped_disease_targets:
+            raise ValueError("diseases_of_interest must be provided when disease_token_sets is used")
         diseases_of_interest = get_common_diseases(labels_df, filter_min_total, apply_token_shift=_apply_token_shift)
+    diseases_of_interest = [int(d) for d in diseases_of_interest]
+    if exclude_diseases_of_interest:
+        diseases_before_exclusion = len(diseases_of_interest)
+        diseases_of_interest = [d for d in diseases_of_interest if d not in exclude_diseases_of_interest]
+        diseases_excluded = diseases_before_exclusion - len(diseases_of_interest)
+        if diseases_excluded > 0:
+            target_label = "disease groups" if grouped_disease_targets else "diseases"
+            print(
+                f"Excluded {diseases_excluded} requested {target_label}: "
+                f"{sorted(exclude_diseases_of_interest)}"
+            )
     
-    # Filter out invalid indices (must be < vocab_size)
-    # Note: token indices are 0-based, so valid range is [0, vocab_size)
-    diseases_of_interest = [d for d in diseases_of_interest if 0 <= d < vocab_size]
+    if grouped_disease_targets:
+        missing_groups = [d for d in diseases_of_interest if d not in disease_token_sets]
+        if missing_groups:
+            raise ValueError(f"Missing disease_token_sets entries for disease groups: {missing_groups[:10]}")
+
+        filtered_token_sets = {}
+        for group_id in diseases_of_interest:
+            valid_tokens = [
+                int(tok) for tok in disease_token_sets[group_id]
+                if 0 <= int(tok) < vocab_size
+            ]
+            if valid_tokens:
+                filtered_token_sets[group_id] = sorted(set(valid_tokens))
+        diseases_before_vocab_filter = len(diseases_of_interest)
+        diseases_of_interest = [d for d in diseases_of_interest if d in filtered_token_sets]
+        disease_token_sets = filtered_token_sets
+        diseases_filtered_vocab = diseases_before_vocab_filter - len(diseases_of_interest)
+        if diseases_filtered_vocab > 0:
+            print(f"Filtered out {diseases_filtered_vocab} disease groups with no valid model-vocab tokens")
+    else:
+        # Filter out invalid indices (must be < vocab_size)
+        # Note: token indices are 0-based, so valid range is [0, vocab_size)
+        diseases_of_interest = [d for d in diseases_of_interest if 0 <= d < vocab_size]
     
     if model_type != 'composite':
         raise ValueError("Only composite model_type is supported.")
@@ -877,27 +1513,46 @@ def evaluate_auc_pipeline(
     
     # Filter diseases to only those present in the evaluation data
     diseases_before_filter = len(diseases_of_interest)
-    diseases_of_interest = [d for d in diseases_of_interest if d in actual_tokens_in_data]
+    if grouped_disease_targets:
+        diseases_of_interest = [
+            d for d in diseases_of_interest
+            if any(tok in actual_tokens_in_data for tok in disease_token_sets.get(d, []))
+        ]
+    else:
+        diseases_of_interest = [d for d in diseases_of_interest if d in actual_tokens_in_data]
     diseases_filtered_eval = diseases_before_filter - len(diseases_of_interest)
     
     if diseases_filtered_eval > 0:
-        print(f"Filtered out {diseases_filtered_eval} diseases not present in evaluation data")
+        target_label = "disease groups" if grouped_disease_targets else "diseases"
+        print(f"Filtered out {diseases_filtered_eval} {target_label} not present in evaluation data")
     
     # CRITICAL: Filter to only include tokens present in train data
     # This ensures we only evaluate tokens the model was trained on
     # (e.g., excludes SGLT-2, Other if not in train)
     if train_valid_tokens is not None:
         diseases_before_train_filter = len(diseases_of_interest)
-        diseases_of_interest = [d for d in diseases_of_interest if d in train_valid_tokens]
+        if grouped_disease_targets:
+            disease_token_sets = {
+                group_id: [tok for tok in disease_token_sets[group_id] if tok in train_valid_tokens]
+                for group_id in diseases_of_interest
+            }
+            diseases_of_interest = [
+                group_id for group_id in diseases_of_interest
+                if len(disease_token_sets.get(group_id, [])) > 0
+            ]
+        else:
+            diseases_of_interest = [d for d in diseases_of_interest if d in train_valid_tokens]
         diseases_filtered_train = diseases_before_train_filter - len(diseases_of_interest)
         
         if diseases_filtered_train > 0:
-            print(f"Filtered out {diseases_filtered_train} diseases not present in train data")
+            target_label = "disease groups" if grouped_disease_targets else "diseases"
+            print(f"Filtered out {diseases_filtered_train} {target_label} not present in train data")
     
     if len(diseases_of_interest) == 0:
         raise ValueError(f"No valid diseases found. All indices must be in range [0, {vocab_size}), present in evaluation data, and present in train data")
     
-    print(f"Evaluating {len(diseases_of_interest)} diseases (vocab_size={vocab_size}, actual unique tokens in eval data={len(actual_tokens_in_data)})")
+    target_label = "disease groups" if grouped_disease_targets else "diseases"
+    print(f"Evaluating {len(diseases_of_interest)} {target_label} (vocab_size={vocab_size}, actual unique tokens in eval data={len(actual_tokens_in_data)})")
 
     # Split diseases into chunks for processing
     num_chunks = (len(diseases_of_interest) + disease_chunk_size - 1) // disease_chunk_size
@@ -913,13 +1568,56 @@ def evaluate_auc_pipeline(
     # Precompute prediction indices: find positions where input age <= target age - offset
     pred_idx_precompute = (d[1][:, :, np.newaxis] <= d[3][:, np.newaxis, :] - offset).sum(1) - 1
 
+    # --- Sex detection per patient ---
+    _apply_shift = bool(getattr(model.config, 'apply_token_shift', False))
+    sex_arr = _detect_sex_per_patient(data_tokens, _apply_shift)
+    n_female = int((sex_arr == 1).sum())
+    n_male = int((sex_arr == 2).sum())
+    print(f"Sex distribution: female={n_female}, male={n_male}, unknown={int((sex_arr == 0).sum())}")
+
+    requested_sex_slices = {
+        item.strip().lower()
+        for item in str(auc_sex_slices).split(",")
+        if item.strip()
+    }
+    if not requested_sex_slices:
+        requested_sex_slices = {"all"}
+    invalid_sex_slices = requested_sex_slices - {"all", "female", "male"}
+    if invalid_sex_slices:
+        raise ValueError(
+            f"Unsupported auc_sex_slices entries: {sorted(invalid_sex_slices)}. "
+            "Expected a comma-separated subset of all,female,male."
+        )
+    if "all" not in requested_sex_slices:
+        requested_sex_slices.add("all")
+
+    sex_slices = [("all", None)]
+    if "female" in requested_sex_slices and n_female >= 10:
+        sex_slices.append(("female", 1))
+    if "male" in requested_sex_slices and n_male >= 10:
+        sex_slices.append(("male", 2))
+    if meta_info is not None:
+        meta_info["auc_sex_slices"] = ",".join(label for label, _ in sex_slices)
+
+    # Pre-filter data / pred_idx per sex (avoid recomputing inside the chunk loop)
+    sex_data = {}
+    for sex_label, sex_val in sex_slices:
+        if sex_val is None:
+            sex_data[sex_label] = (d, pred_idx_precompute)
+        else:
+            d_sub, _, pred_sub = _filter_data_by_sex(d, None, pred_idx_precompute, sex_arr, sex_val)
+            sex_data[sex_label] = (d_sub, pred_sub)
+
     all_aucs = []
     tqdm_options = {"desc": "Processing disease chunks", "total": len(diseases_chunks)}
     for disease_chunk_idx, diseases_chunk in tqdm(enumerate(diseases_chunks), **tqdm_options):
-        # Filter out invalid indices for this chunk
         diseases_chunk = np.array(diseases_chunk)
-        valid_mask = (diseases_chunk >= 0) & (diseases_chunk < vocab_size)
-        diseases_chunk = diseases_chunk[valid_mask].tolist()
+        if grouped_disease_targets:
+            diseases_chunk = diseases_chunk.tolist()
+        else:
+            # Filter out invalid indices for this chunk
+            valid_mask = (diseases_chunk >= 0) & (diseases_chunk < vocab_size)
+            diseases_chunk = diseases_chunk[valid_mask].tolist()
         
         if len(diseases_chunk) == 0:
             print(f"Skipping chunk {disease_chunk_idx}: no valid diseases")
@@ -942,11 +1640,12 @@ def evaluate_auc_pipeline(
                 batch_x_ages = x_ages[start_idx:end_idx].to(device)
 
                 outputs = model(
-                    batch_x_data, batch_x_shift, batch_x_total, batch_x_ages
+                    batch_x_data, batch_x_shift, batch_x_total, batch_x_ages,
+                    return_attention=False,
                 )[0]  # Get logits dict
 
-                data_logits = outputs['data'].cpu().detach().numpy()
-                p100k.append(data_logits[:, :, diseases_chunk].astype("float16"))
+                scores = _disease_scores(outputs, diseases_chunk)
+                p100k.append(scores.cpu().detach().numpy().astype("float16"))
         
         if len(p100k) == 0:
             print(f"Skipping chunk {disease_chunk_idx}: no predictions generated")
@@ -954,36 +1653,67 @@ def evaluate_auc_pipeline(
         
         p100k = np.vstack(p100k)
 
-        # Loop over each disease (token) in the current chunk, sexes separately
-        # Note: For now, we process all data together. Sex filtering can be added if needed.
+        # Pre-filter p100k per sex
+        sex_p = {}
+        for sex_label, sex_val in sex_slices:
+            if sex_val is None:
+                sex_p[sex_label] = p100k
+            else:
+                sex_p[sex_label] = p100k[sex_arr == sex_val]
+
         for j, k in tqdm(
             list(enumerate(diseases_chunk)), desc=f"Processing diseases in chunk {disease_chunk_idx}"
         ):
-            # Get calibration AUC for the current disease token.
-            out = get_calibration_auc(
-                j,
-                k,
-                d,
-                p100k,
-                diseases_chunk,
-                age_groups=age_groups,
-                offset=offset,
-                precomputed_idx=pred_idx_precompute,
-                n_bootstrap=n_bootstrap,
-                use_delong=True,
-            )
-            if out is None:
-                continue
-            for out_item in out:
-                all_aucs.append(out_item)
+            target_tokens = disease_token_sets.get(int(k), [int(k)]) if grouped_disease_targets else [int(k)]
+            for sex_label, _ in sex_slices:
+                d_sex, pred_sex = sex_data[sex_label]
+                p_sex = sex_p[sex_label]
+                out = get_calibration_auc(
+                    j,
+                    k,
+                    d_sex,
+                    p_sex,
+                    diseases_chunk,
+                    age_groups=age_groups,
+                    offset=offset,
+                    precomputed_idx=pred_sex,
+                    n_bootstrap=n_bootstrap,
+                    use_delong=use_delong,
+                    target_tokens=target_tokens,
+                    exclude_control_tokens=exclude_auc_control_tokens,
+                )
+                if out is None:
+                    continue
+                for out_item in out:
+                    out_item["sex"] = sex_label
+                    all_aucs.append(out_item)
 
     df_auc_unpooled = pd.DataFrame(all_aucs)
 
     for key, value in meta_info.items():
         df_auc_unpooled[key] = value
 
+    def _attach_group_metadata(df):
+        if df is None or df.empty or not grouped_disease_targets:
+            return df
+        df = df.copy()
+        df["ckb_codebook_id"] = df["token"].astype(int)
+        if disease_label_map:
+            df["name"] = df["ckb_codebook_id"].map(disease_label_map)
+        if disease_icd_code_map:
+            df["icd10_codes"] = df["ckb_codebook_id"].map(disease_icd_code_map)
+        df["target_tokens"] = df["ckb_codebook_id"].map(
+            lambda group_id: ",".join(map(str, disease_token_sets.get(int(group_id), [])))
+        )
+        df["n_target_tokens"] = df["ckb_codebook_id"].map(
+            lambda group_id: len(disease_token_sets.get(int(group_id), []))
+        )
+        return df
+
     # Merge with labels if available
-    if 'index' in labels_df.columns:
+    if grouped_disease_targets:
+        df_auc_unpooled_merged = _attach_group_metadata(df_auc_unpooled)
+    elif 'index' in labels_df.columns:
         labels_df_subset = labels_df[['index']].copy()
         if 'name' in labels_df.columns:
             labels_df_subset['name'] = labels_df['name']
@@ -996,14 +1726,30 @@ def evaluate_auc_pipeline(
         df_auc_unpooled_merged = df_auc_unpooled.copy()
     df_auc_unpooled_merged = finalize_token_columns(df_auc_unpooled_merged)
 
+    # Age-stratified summary (use "all" sex only for backward-compatible age table)
+    _unpooled_all = df_auc_unpooled_merged
+    if "sex" in _unpooled_all.columns:
+        _unpooled_all = _unpooled_all.loc[_unpooled_all["sex"] == "all"]
+    df_auc_age_stratified = build_age_stratified_auc_summary(_unpooled_all)
+    if df_auc_age_stratified is not None and not df_auc_age_stratified.empty:
+        print("\n[AUC by age stratum] (across diseases; prediction-time age bin, years)")
+        print(df_auc_age_stratified.to_string(index=False))
+
+    # Sex-stratified summary
+    df_auc_sex_stratified = build_sex_stratified_auc_summary(df_auc_unpooled_merged)
+    if df_auc_sex_stratified is not None and not df_auc_sex_stratified.empty:
+        print("\n[AUC by sex stratum] (across diseases)")
+        print(df_auc_sex_stratified.to_string(index=False))
+
     def aggregate_age_brackets_delong(group):
         # For normal distributions, when averaging n of them:
         # The variance of the sum is the sum of variances
         # The variance of the average is the sum of variances divided by n^2
         n = len(group)
+        auc_col = "auc_delong" if use_delong and "auc_delong" in group.columns else "auc"
         
         # Handle cases where all AUC values are NaN (insufficient data)
-        valid_aucs = group['auc_delong'].dropna()
+        valid_aucs = group[auc_col].dropna()
         if len(valid_aucs) == 0:
             mean = np.nan
             var = np.nan
@@ -1011,8 +1757,11 @@ def evaluate_auc_pipeline(
         else:
             mean = valid_aucs.mean()
             # Since we're taking the average, divide combined variance by n^2
-            valid_vars = group.loc[valid_aucs.index, 'auc_variance_delong']
-            var = valid_vars.sum() / (len(valid_vars)**2) if len(valid_vars) > 0 else np.nan
+            if use_delong and "auc_variance_delong" in group.columns:
+                valid_vars = group.loc[valid_aucs.index, 'auc_variance_delong']
+                var = valid_vars.sum() / (len(valid_vars)**2) if len(valid_vars) > 0 else np.nan
+            else:
+                var = np.nan
             status = 'ok'
         
         # Ensure var is a scalar (not array) for parquet compatibility
@@ -1030,26 +1779,37 @@ def evaluate_auc_pipeline(
             'status': status,
         })
 
-    print('Using DeLong method to calculate AUC confidence intervals..')
+    if use_delong:
+        print('Using DeLong method to calculate AUC confidence intervals..')
     
-    # Use include_groups=False to suppress FutureWarning in pandas
-    df_auc = df_auc_unpooled.groupby(["token"]).apply(aggregate_age_brackets_delong, include_groups=False).reset_index()
+    group_cols = ["token", "sex"] if "sex" in df_auc_unpooled.columns else ["token"]
+    df_auc = df_auc_unpooled.groupby(group_cols).apply(aggregate_age_brackets_delong, include_groups=False).reset_index()
     
     if 'index' in labels_df.columns:
-        _apply_shift = bool(getattr(model.config, 'apply_token_shift', False))
-        labels_df_for_merge = build_labels_df_for_merge(labels_df, _apply_shift)
-        df_auc_merged = df_auc.merge(labels_df_for_merge, left_on="token", right_on="shifted_token", how="inner")
+        if grouped_disease_targets:
+            df_auc_merged = _attach_group_metadata(df_auc)
+        else:
+            _apply_shift = bool(getattr(model.config, 'apply_token_shift', False))
+            labels_df_for_merge = build_labels_df_for_merge(labels_df, _apply_shift)
+            df_auc_merged = df_auc.merge(labels_df_for_merge, left_on="token", right_on="shifted_token", how="inner")
     else:
-        df_auc_merged = df_auc.copy()
+        df_auc_merged = _attach_group_metadata(df_auc) if grouped_disease_targets else df_auc.copy()
     df_auc_merged = finalize_token_columns(df_auc_merged)
     
     # Evaluate composite fields (SHIFT, TOTAL) if composite model and enabled
     composite_metrics = None
     if evaluate_composite:
         print("\nEvaluating composite fields (SHIFT, TOTAL)...")
+        aux_eval_model = model if composite_model is None else composite_model
         composite_metrics = evaluate_composite_fields(
-            model, d100k, batch_size=batch_size, device=device
+            aux_eval_model,
+            d100k,
+            batch_size=batch_size,
+            device=device,
+            raw_output_path=composite_raw_output_path,
+            raw_output_prefix=composite_raw_output_prefix,
         )
+        composite_metrics = {**meta_info, **composite_metrics}
         
         # Print results: drug-token subset only (same metrics as *_drug_cond); no extra section title.
         print("\nComposite Field Evaluation Results:")
@@ -1129,7 +1889,6 @@ def evaluate_auc_pipeline(
         
         # Save composite metrics
         if output_path is not None:
-            import json
             with open(f"{output_path}/composite_metrics.json", 'w') as f:
                 # Convert numpy types to native Python types for JSON
                 json_metrics = {}
@@ -1155,10 +1914,24 @@ def evaluate_auc_pipeline(
     
     if output_path is not None:
         Path(output_path).mkdir(exist_ok=True, parents=True)
-        df_auc_merged.to_parquet(f"{output_path}/df_both.parquet", index=False)
+        # Backward-compatible pooled file: keep only sex=="all"
+        _merged_all = df_auc_merged
+        if "sex" in df_auc_merged.columns:
+            _merged_all = df_auc_merged.loc[df_auc_merged["sex"] == "all"]
+        _merged_all.to_parquet(f"{output_path}/df_both.parquet", index=False)
         df_auc_unpooled_merged.to_parquet(f"{output_path}/df_auc_unpooled.parquet", index=False)
+        if df_auc_age_stratified is not None and not df_auc_age_stratified.empty:
+            df_auc_age_stratified.to_parquet(f"{output_path}/df_auc_age_stratified.parquet", index=False)
+            df_auc_age_stratified.to_csv(f"{output_path}/df_auc_age_stratified.csv", index=False)
+        if df_auc_sex_stratified is not None and not df_auc_sex_stratified.empty:
+            df_auc_sex_stratified.to_parquet(f"{output_path}/df_auc_sex_stratified.parquet", index=False)
+            df_auc_sex_stratified.to_csv(f"{output_path}/df_auc_sex_stratified.csv", index=False)
+        # Per-sex pooled AUC (one row per token × sex)
+        if "sex" in df_auc_merged.columns:
+            df_auc_merged.to_parquet(f"{output_path}/df_both_by_sex.parquet", index=False)
+            df_auc_merged.to_csv(f"{output_path}/df_both_by_sex.csv", index=False)
 
-    return df_auc_unpooled_merged, df_auc_merged, composite_metrics
+    return df_auc_unpooled_merged, df_auc_merged, composite_metrics, df_auc_age_stratified, df_auc_sex_stratified
 
 
 def main():
@@ -1166,6 +1939,12 @@ def main():
     parser.add_argument("--input_path", type=str, default="../data", help="Path to the dataset")
     parser.add_argument("--output_path", type=str, default="results", help="Path to the output")
     parser.add_argument("--model_ckpt_path", type=str, required=True, help="Path to the model weights")
+    parser.add_argument(
+        "--aux_model_ckpt_path",
+        type=str,
+        default=None,
+        help="Optional checkpoint used only for composite SHIFT/TOTAL evaluation.",
+    )
     parser.add_argument("--model_type", type=str, default='composite', choices=['composite'],
                         help="Model type (composite only)")
     parser.add_argument("--no_event_token_rate", type=int, default=5, help="No event token rate")
@@ -1180,10 +1959,68 @@ def main():
     parser.add_argument("--labels_path", type=str, default=None, help="Path to labels CSV file")
     parser.add_argument("--block_size", type=int, default=512, help="Block size for data loading")
     parser.add_argument("--eval_batch_size", type=int, default=64, help="Batch size for model inference during evaluation")
+    parser.add_argument(
+        "--keep_batch_on_cpu",
+        action="store_true",
+        help=(
+            "Keep the large prepared evaluation batch on CPU RAM and move only "
+            "inference mini-batches to the selected device. Useful for full "
+            "external cohorts that do not fit in GPU memory."
+        ),
+    )
+    parser.add_argument("--offset", type=float, default=0.1,
+                        help="Prediction lead-time offset in days for disease AUC evaluation")
+    parser.add_argument(
+        "--disease_score_mode",
+        type=str,
+        default="logits",
+        choices=["logits", "data_prob", "risk", "time_rate"],
+        help=(
+            "Score used for disease AUC. logits preserves the historical behavior; "
+            "risk uses softmax(DATA) times the time-head probability of any event by --offset."
+        ),
+    )
+    parser.add_argument("--age_group_min", type=int, default=40,
+                        help="Min age (years) for AUC age-stratification bins (prediction-time age)")
+    parser.add_argument("--age_group_max", type=int, default=80,
+                        help="Max age (years, exclusive) for AUC age-stratification bins")
+    parser.add_argument("--age_group_step", type=int, default=5,
+                        help="Width of each age bin in years (must be uniform; same as get_calibration_auc)")
+    parser.add_argument("--auc_sex_slices", type=str, default="all,female,male",
+                        help="Comma-separated sex strata for AUC computation. Always includes all.")
     parser.add_argument("--data_files", type=str, default=None, 
-                        help="Comma-separated list of data files to evaluate (e.g., 'kr_val.bin,kr_test.bin'). If None, evaluates all: kr_val.bin, kr_test.bin, JMDC_extval.bin, UKB_extval.bin")
-    parser.add_argument("--train_data_file", type=str, default="kr_train.bin",
-                        help="Train data file to filter valid tokens. Only tokens present in train data will be evaluated.")
+                        help="Comma-separated list of data files to evaluate (e.g., 'kr_val.bin,kr_test.bin'). If None, evaluates all: kr_val.bin, kr_test.bin, JMDC_extval.bin, UKB_extval.bin, ckb_extval.bin")
+    parser.add_argument("--ckb_eval_mode", type=str, default="codebook_icd_overlap",
+                        choices=["codebook_icd_overlap", "exact_data_tokens"],
+                        help=(
+                            "CKB DATA AUC mode. codebook_icd_overlap evaluates the attached CKB "
+                            "disease groups and treats any overlapping ICD-10 level-3 token as a case; "
+                            "exact_data_tokens preserves the old exact-token evaluation."
+                        ))
+    parser.add_argument("--ckb_include_drug_death", action="store_true",
+                        help="For ckb_extval.bin exact_data_tokens mode, include drug tokens and Death in DATA AUC targets. Default evaluates disease tokens only.")
+    parser.add_argument("--include_cohort_diabetes_targets", action="store_true",
+                        help=(
+                            "Deprecated compatibility flag. Diabetes diagnosis targets are included by default."
+                        ))
+    parser.add_argument("--train_data_file", type=str, default="train_inner.bin",
+                        help="Inner train data file used for diagnostics/token filtering.")
+    parser.add_argument("--next_token_data_file", type=str, default="kr_val.bin",
+                        help="Data file for final internal next-token prediction evaluation.")
+    parser.add_argument("--next_token_subset_size", type=int, default=None,
+                        help="Patient subset size for next-token prediction (-1 for all). Defaults to dataset_subset_size.")
+    parser.add_argument("--skip_next_token_prediction", action="store_true",
+                        help="Skip final internal next-token prediction evaluation.")
+    parser.add_argument("--skip_composite_fields", action="store_true",
+                        help="Skip SHIFT/TOTAL composite field metrics and compute Disease AUC only.")
+    parser.add_argument("--save_composite_raw_predictions", action="store_true",
+                        help="Save per-event SHIFT probabilities and TOTAL predictions for plotting and threshold tuning.")
+    parser.add_argument("--skip_delong", action="store_true",
+                        help="Skip DeLong variance/CI columns. Mean/median AUC values are still computed.")
+    parser.add_argument("--exclude_eot_from_auc_controls", action="store_true",
+                        help="For pp data, exclude EOT target rows from disease AUC control positions.")
+    parser.add_argument("--auc_eot_token", type=int, default=None,
+                        help="DATA token ID to treat as EOT for --exclude_eot_from_auc_controls. Defaults to checkpoint model_args['eot_token'].")
     args = parser.parse_args()
 
     input_path = args.input_path
@@ -1212,10 +2049,20 @@ def main():
     print(device)
     seed = 1337
 
+    age_groups = np.arange(args.age_group_min, args.age_group_max, args.age_group_step)
+    if age_groups.size < 2:
+        raise ValueError(
+            "Need at least two age bin starts for AUC evaluation. "
+            "Adjust --age_group_min, --age_group_max, or --age_group_step."
+        )
+
     # Load model checkpoint and initialize model.
     ckpt_path = args.model_ckpt_path
     checkpoint = torch.load(ckpt_path, map_location=device)
     model_args = dict(checkpoint["model_args"])
+    eval_eot_token = args.auc_eot_token
+    if eval_eot_token is None and model_args.get('eot_token') is not None:
+        eval_eot_token = int(model_args.get('eot_token'))
     eval_apply_token_shift = bool(model_args.get('apply_token_shift', False))
     eval_separate_shift_na = bool(model_args.get('separate_shift_na_from_padding', False))
     eval_shift_na_raw_token = int(model_args.get('shift_na_raw_token', 4))
@@ -1254,6 +2101,35 @@ def main():
     model.load_state_dict(cleaned)
     model.eval()
     model = model.to(device)
+
+    aux_model = None
+    if args.aux_model_ckpt_path:
+        aux_checkpoint = torch.load(args.aux_model_ckpt_path, map_location=device)
+        aux_model_args = dict(aux_checkpoint["model_args"])
+        aux_apply_token_shift = bool(aux_model_args.get('apply_token_shift', False))
+        aux_separate_shift_na = bool(aux_model_args.get('separate_shift_na_from_padding', False))
+        if aux_apply_token_shift != eval_apply_token_shift:
+            raise ValueError(
+                "aux_model_ckpt_path apply_token_shift does not match primary model: "
+                f"{aux_apply_token_shift} != {eval_apply_token_shift}"
+            )
+        if aux_separate_shift_na != eval_separate_shift_na:
+            raise ValueError(
+                "aux_model_ckpt_path separate_shift_na_from_padding does not match primary model: "
+                f"{aux_separate_shift_na} != {eval_separate_shift_na}"
+            )
+        aux_state_dict = aux_checkpoint["model"]
+        aux_cleaned = {}
+        for k, v in aux_state_dict.items():
+            k = k.replace('module.', '').replace('_orig_mod.', '')
+            aux_cleaned[k] = v
+        aux_model_args = {k: v for k, v in aux_model_args.items() if k in valid_fields}
+        aux_conf = CompositeDelphiConfig(**aux_model_args)
+        aux_model = CompositeDelphi(aux_conf)
+        aux_model.load_state_dict(aux_cleaned)
+        aux_model.eval()
+        aux_model = aux_model.to(device)
+        print(f"Auxiliary model for SHIFT/TOTAL: {args.aux_model_ckpt_path}")
     
     # Print model architecture info
     print(f"\n{'='*60}")
@@ -1294,7 +2170,9 @@ def main():
             if f:
                 # Generate prefix from filename
                 f_lower = f.lower()
-                if 'ukb' in f_lower and 'extval' in f_lower:
+                if 'ckb' in f_lower:
+                    prefix = 'extval_ckb'
+                elif 'ukb' in f_lower and 'extval' in f_lower:
                     prefix = 'extval_ukb'
                 elif 'jmdc' in f_lower and 'extval' in f_lower:
                     prefix = 'extval_jmdc'
@@ -1314,13 +2192,24 @@ def main():
             ("kr_test.bin", "test"),
             ("JMDC_extval.bin", "extval_jmdc"),
             ("UKB_extval.bin", "extval_ukb"),
+            ("ckb_extval.bin", "extval_ckb"),
         ]
     
     # Prepare meta info for results (base)
     base_meta_info = {
         'model_type': model_type,
         'use_moe': use_moe,
+        'eval_offset_days': args.offset,
+        'exclude_eot_from_auc_controls': bool(args.exclude_eot_from_auc_controls),
     }
+    if eval_eot_token is not None:
+        base_meta_info['eot_token'] = int(eval_eot_token)
+    exclude_auc_control_tokens = []
+    if args.exclude_eot_from_auc_controls:
+        if eval_eot_token is None:
+            print("[WARNING] --exclude_eot_from_auc_controls requested, but no EOT token was found. No control tokens will be excluded.")
+        else:
+            exclude_auc_control_tokens = [int(eval_eot_token)]
     if use_moe:
         base_meta_info['num_experts'] = num_experts
         base_meta_info['experts_per_token'] = experts_per_token
@@ -1330,6 +2219,8 @@ def main():
         base_meta_info['checkpoint_iter'] = checkpoint['iter_num']
     if 'best_val_loss' in checkpoint:
         base_meta_info['checkpoint_val_loss'] = checkpoint['best_val_loss']
+    if args.aux_model_ckpt_path:
+        base_meta_info['aux_model_ckpt_path'] = args.aux_model_ckpt_path
 
     # Define dtype for composite data
     # IMPORTANT: Must match train_model.py exactly!
@@ -1341,6 +2232,80 @@ def main():
         ('SHIFT', np.uint32),
         ('TOTAL', np.uint32)
     ])
+
+    if not args.skip_next_token_prediction:
+        next_token_path = Path(input_path) / args.next_token_data_file
+        if not next_token_path.exists():
+            print(f"\n[WARNING] Next-token data not found: {next_token_path}. Skipping next-token prediction.")
+        else:
+            print(f"\n{'='*60}")
+            print(f"Final internal next-token prediction: {args.next_token_data_file}")
+            print(f"{'='*60}\n")
+
+            next_token_data = np.fromfile(next_token_path, dtype=composite_dtype)
+            next_token_p2i = get_p2i_composite(next_token_data)
+            next_token_subset_size = (
+                dataset_subset_size
+                if args.next_token_subset_size is None
+                else args.next_token_subset_size
+            )
+            if next_token_subset_size == -1:
+                next_token_subset_size = len(next_token_p2i)
+            else:
+                next_token_subset_size = min(next_token_subset_size, len(next_token_p2i))
+
+            rng = np.random.default_rng(seed)
+            next_token_patient_indices = rng.choice(
+                len(next_token_p2i),
+                size=next_token_subset_size,
+                replace=False,
+            )
+            next_token_patient_indices = sorted(next_token_patient_indices.tolist())
+
+            next_token_metrics = evaluate_next_token_prediction(
+                model,
+                next_token_data,
+                next_token_p2i,
+                next_token_patient_indices,
+                block_size=args.block_size,
+                batch_size=args.eval_batch_size,
+                device=device,
+                no_event_token_rate=no_event_token_rate,
+                apply_token_shift=eval_apply_token_shift,
+                separate_shift_na_from_padding=eval_separate_shift_na,
+                shift_na_raw_token=eval_shift_na_raw_token,
+            )
+            next_token_metrics = {
+                **base_meta_info,
+                **next_token_metrics,
+                "data_source": args.next_token_data_file,
+                "data_prefix": "internal_test",
+                "evaluation_role": "final_internal_test_next_token",
+                "subset_size_requested": int(
+                    dataset_subset_size
+                    if args.next_token_subset_size is None
+                    else args.next_token_subset_size
+                ),
+                "total_patients_available": int(len(next_token_p2i)),
+            }
+
+            print(
+                "[next-token] "
+                f"loss={next_token_metrics['next_token_loss']:.4f}, "
+                f"data={next_token_metrics['next_token_loss_data']:.4f}, "
+                f"shift={next_token_metrics['next_token_loss_shift']:.4f}, "
+                f"total={next_token_metrics['next_token_loss_total']:.4f}, "
+                f"time={next_token_metrics['next_token_loss_time']:.4f}, "
+                f"patients={next_token_metrics['next_token_patients']}"
+            )
+
+            if output_path is not None:
+                metrics_json_path = Path(output_path) / "internal_test_next_token_metrics.json"
+                metrics_csv_path = Path(output_path) / "internal_test_next_token_metrics.csv"
+                with open(metrics_json_path, "w") as f:
+                    json.dump(next_token_metrics, f, indent=2)
+                pd.DataFrame([next_token_metrics]).to_csv(metrics_csv_path, index=False)
+                print(f"[next-token] metrics saved to {metrics_json_path}")
     
     # ============================================================
     # DIAGNOSTIC: Check SHIFT values in raw data (before +1 shift)
@@ -1433,7 +2398,7 @@ def main():
             data_p2i,
             select="left",
             block_size=args.block_size,
-            device=device,
+            device="cpu" if args.keep_batch_on_cpu else device,
             padding="random",
             no_event_token_rate=no_event_token_rate,
             apply_token_shift=eval_apply_token_shift,
@@ -1445,6 +2410,64 @@ def main():
         meta_info = base_meta_info.copy()
         meta_info['data_source'] = data_filename
         meta_info['data_prefix'] = prefix
+
+        diseases_of_interest = None
+        disease_token_sets = None
+        disease_label_map = None
+        disease_icd_code_map = None
+        exclude_diseases_of_interest = set()
+        if prefix == 'extval_ckb':
+            # CKB is a DATA-only external validation set with DATA values already
+            # encoded as model vocabulary IDs. By default, evaluate the CKB
+            # codebook disease groups: a group is positive if any of its ICD-10
+            # level-3 DATA tokens appears in the target.
+            token_offset = get_data_token_offset(eval_apply_token_shift)
+            if args.ckb_eval_mode == "codebook_icd_overlap":
+                if args.ckb_include_drug_death:
+                    print("[WARNING] --ckb_include_drug_death is ignored in CKB codebook_icd_overlap mode.")
+                (
+                    disease_token_sets,
+                    disease_label_map,
+                    disease_icd_code_map,
+                    ckb_missing_code_map,
+                ) = build_ckb_codebook_group_maps(
+                    labels_df,
+                    token_offset=token_offset,
+                    vocab_size=getattr(model.config, "vocab_size", None),
+                )
+                diseases_of_interest = sorted(disease_token_sets)
+                ckb_target_mode = "codebook_icd_overlap"
+                meta_info['ckb_target_mode'] = ckb_target_mode
+                meta_info['ckb_codebook_groups_requested'] = ",".join(map(str, diseases_of_interest))
+                meta_info['ckb_codebook_score_aggregation'] = (
+                    "max_logit" if args.disease_score_mode == "logits" else "sum_scores"
+                )
+                if ckb_missing_code_map:
+                    meta_info['ckb_codebook_groups_with_missing_codes'] = json.dumps(ckb_missing_code_map, sort_keys=True)
+                print(
+                    f"CKB target mode: {ckb_target_mode} "
+                    f"({len(diseases_of_interest)} codebook groups before batch filtering; "
+                    f"score aggregation={meta_info['ckb_codebook_score_aggregation']})"
+                )
+            else:
+                raw_tokens = np.unique(data['DATA']).astype(np.int64)
+                ckb_targets = raw_tokens[raw_tokens >= MIN_DISEASE_RAW_TOKEN_INDEX] + token_offset
+                if args.ckb_include_drug_death:
+                    ckb_target_mode = "exact_data_tokens_including_drug_death"
+                else:
+                    ckb_targets = ckb_targets[ckb_targets < _eval_drug_min]
+                    ckb_target_mode = "exact_disease_tokens_only"
+                diseases_of_interest = sorted({int(tok) for tok in ckb_targets.tolist()})
+                meta_info['ckb_target_mode'] = ckb_target_mode
+                meta_info['ckb_target_tokens_requested'] = ",".join(map(str, diseases_of_interest))
+                print(
+                    f"CKB target mode: {ckb_target_mode} "
+                    f"({len(diseases_of_interest)} DATA targets before batch filtering)"
+                )
+        
+        if prefix == 'extval_ckb' and disease_token_sets is not None:
+            exclude_diseases_of_interest.add(CKB_MALIGNANT_NEOPLASMS_CODEBOOK_GROUP_ID)
+            meta_info['excluded_ckb_codebook_groups'] = str(CKB_MALIGNANT_NEOPLASMS_CODEBOOK_GROUP_ID)
         
         # Call the internal evaluation function (don't save files yet - we'll save with prefix)
         result = evaluate_auc_pipeline(
@@ -1453,26 +2476,44 @@ def main():
             output_path=None,  # Don't save internally, we'll save with prefix
             labels_df=labels_df,
             model_type=model_type,
-            # UKB external validation: only AUC is needed (skip SHIFT/TOTAL)
-            evaluate_composite=(prefix != 'extval_ukb'),
-            diseases_of_interest=None,
+            # UKB/CKB external validation: only DATA AUC is needed (skip SHIFT/TOTAL).
+            evaluate_composite=(prefix not in DATA_ONLY_EXTVAL_PREFIXES and not args.skip_composite_fields),
+            diseases_of_interest=diseases_of_interest,
             filter_min_total=args.filter_min_total,
             disease_chunk_size=args.disease_chunk_size,
+            age_groups=age_groups,
             batch_size=args.eval_batch_size,
             device=device,
             seed=seed,
             n_bootstrap=args.n_bootstrap,
+            offset=args.offset,
+            disease_score_mode=args.disease_score_mode,
             meta_info=meta_info,
             train_valid_tokens=None,  # No train filtering - evaluate all tokens in data
+            composite_model=aux_model,
+            auc_sex_slices=args.auc_sex_slices,
+            use_delong=not args.skip_delong,
+            disease_token_sets=disease_token_sets,
+            disease_label_map=disease_label_map,
+            disease_icd_code_map=disease_icd_code_map,
+            exclude_diseases_of_interest=exclude_diseases_of_interest,
+            exclude_auc_control_tokens=exclude_auc_control_tokens,
+            composite_raw_output_path=output_path if args.save_composite_raw_predictions else None,
+            composite_raw_output_prefix=prefix,
         )
         
-        df_auc_unpooled_merged, df_auc_merged, composite_metrics = result
+        df_auc_unpooled_merged, df_auc_merged, composite_metrics, df_auc_age_stratified, df_auc_sex_stratified = result
 
         if composite_metrics is None:
             composite_metrics = {}
 
-        if df_auc_merged is not None and not df_auc_merged.empty and 'auc' in df_auc_merged.columns:
-            auc_values = df_auc_merged['auc'].dropna()
+        # For backward-compatible AUC statistics, use sex=="all" rows only
+        _df_merged_all = df_auc_merged
+        if "sex" in df_auc_merged.columns:
+            _df_merged_all = df_auc_merged.loc[df_auc_merged["sex"] == "all"]
+
+        if _df_merged_all is not None and not _df_merged_all.empty and 'auc' in _df_merged_all.columns:
+            auc_values = _df_merged_all['auc'].dropna()
             if not auc_values.empty:
                 composite_metrics['auc_mean'] = float(auc_values.mean())
                 composite_metrics['auc_median'] = float(auc_values.median())
@@ -1488,18 +2529,36 @@ def main():
         
         # Save results with prefix
         if output_path is not None:
-            # Save parquet files with prefix (check for None/empty DataFrames)
+            # Backward-compatible pooled file: sex=="all" only
             if df_auc_merged is not None and not df_auc_merged.empty:
-                df_auc_merged.to_parquet(f"{output_path}/{prefix}_df_both.parquet", index=False)
-                df_auc_merged.to_csv(f"{output_path}/{prefix}_df_both.csv", index=False)
+                _save_all = df_auc_merged
+                if "sex" in df_auc_merged.columns:
+                    _save_all = df_auc_merged.loc[df_auc_merged["sex"] == "all"]
+                _save_all.to_parquet(f"{output_path}/{prefix}_df_both.parquet", index=False)
+                _save_all.to_csv(f"{output_path}/{prefix}_df_both.csv", index=False)
+                # Full per-sex pooled AUC
+                if "sex" in df_auc_merged.columns:
+                    df_auc_merged.to_parquet(f"{output_path}/{prefix}_df_both_by_sex.parquet", index=False)
+                    df_auc_merged.to_csv(f"{output_path}/{prefix}_df_both_by_sex.csv", index=False)
             
             if df_auc_unpooled_merged is not None and not df_auc_unpooled_merged.empty:
                 df_auc_unpooled_merged.to_parquet(f"{output_path}/{prefix}_df_auc_unpooled.parquet", index=False)
                 df_auc_unpooled_merged.to_csv(f"{output_path}/{prefix}_df_auc_unpooled.csv", index=False)
+
+            if df_auc_age_stratified is not None and not df_auc_age_stratified.empty:
+                df_auc_age_stratified.to_parquet(
+                    f"{output_path}/{prefix}_df_auc_age_stratified.parquet", index=False
+                )
+                df_auc_age_stratified.to_csv(f"{output_path}/{prefix}_df_auc_age_stratified.csv", index=False)
+
+            if df_auc_sex_stratified is not None and not df_auc_sex_stratified.empty:
+                df_auc_sex_stratified.to_parquet(
+                    f"{output_path}/{prefix}_df_auc_sex_stratified.parquet", index=False
+                )
+                df_auc_sex_stratified.to_csv(f"{output_path}/{prefix}_df_auc_sex_stratified.csv", index=False)
             
             # Save composite metrics with prefix
             if composite_metrics:
-                import json
                 with open(f"{output_path}/{prefix}_composite_metrics.json", 'w') as f:
                     json_metrics = {}
                     for k, v in composite_metrics.items():
@@ -1524,14 +2583,22 @@ def main():
         all_results[prefix] = {
             'df_auc_unpooled': df_auc_unpooled_merged,
             'df_auc_merged': df_auc_merged,
+            'df_auc_age_stratified': df_auc_age_stratified,
+            'df_auc_sex_stratified': df_auc_sex_stratified,
             'composite_metrics': composite_metrics,
             'data_filename': data_filename,
         }
         
+        _n_diseases = len(_df_merged_all) if _df_merged_all is not None else 0
         print(f"\n[{prefix.upper()}] Evaluation completed!")
-        print(f"  Total diseases evaluated: {len(df_auc_merged)}")
+        print(f"  Total diseases evaluated: {_n_diseases}")
         if composite_metrics:
-            print(f"  Composite field metrics saved to {output_path}/{prefix}_composite_metrics.json")
+            metrics_label = (
+                "DATA AUC summary metrics"
+                if prefix in DATA_ONLY_EXTVAL_PREFIXES or args.skip_composite_fields
+                else "Composite field / AUC summary metrics"
+            )
+            print(f"  {metrics_label} saved to {output_path}/{prefix}_composite_metrics.json")
     
     # Print summary
     print(f"\n{'='*60}")
@@ -1540,11 +2607,18 @@ def main():
     print(f"Results saved to: {output_path}")
     for prefix, result_data in all_results.items():
         print(f"\n[{prefix.upper()}] {result_data['data_filename']}:")
-        print(f"  - {prefix}_df_both.parquet / .csv")
+        print(f"  - {prefix}_df_both.parquet / .csv  (sex='all' pooled)")
+        print(f"  - {prefix}_df_both_by_sex.parquet / .csv  (per-sex pooled)")
         print(f"  - {prefix}_df_auc_unpooled.parquet / .csv")
+        print(f"  - {prefix}_df_auc_age_stratified.parquet / .csv")
+        print(f"  - {prefix}_df_auc_sex_stratified.parquet / .csv")
         if result_data['composite_metrics']:
             print(f"  - {prefix}_composite_metrics.json")
-        print(f"  - Diseases evaluated: {len(result_data['df_auc_merged'])}")
+        _df_m = result_data.get('df_auc_merged')
+        _n = 0
+        if _df_m is not None and not _df_m.empty:
+            _n = len(_df_m.loc[_df_m["sex"] == "all"]) if "sex" in _df_m.columns else len(_df_m)
+        print(f"  - Diseases evaluated: {_n}")
 
 
 if __name__ == "__main__":
