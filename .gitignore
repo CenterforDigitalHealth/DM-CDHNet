@@ -26,9 +26,13 @@ _clean/
 runtime_logs
 *_dann.py
 experiments/
+figure/out/
+logs/
 
 sampling_trajectories_.ipynb
 sampling_trajectories_v6.ipynb
 CLAUDE.md
 .claude
+.claude/*
+scripts
 requirements.txt
