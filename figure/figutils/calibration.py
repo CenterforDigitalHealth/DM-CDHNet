@@ -176,15 +176,19 @@ class CalibrationAnalyzer:
             eval_years: float = 3.0):
         """
         For each overlapping patient:
-        1. Feed val history (2002-2010) into the model.
-        2. Extract per-disease hazard rates from time_scale logits.
-        3. Convert to 3-year incidence probability via competing exponentials.
-        4. Check which diseases occurred in test period (2011-2013).
+        1. Feed the final val-history context into the model.
+        2. Combine DATA-head next-event identity probabilities with the
+           TIME-head aggregate next-event hazard:
+             lambda_i = softmax(data_logits)_i * lambda_total
+        3. Hold that hazard fixed and convert it to an approximate multi-year
+           occurrence probability:
+             P(disease_i within T) = 1 - exp(-lambda_i * T)
+        4. Compare it with whether the disease occurred at least once in test.
 
-        Competing-exponentials model:
-          lambda_i = exp(time_logit_i)             per-disease hazard rate
-          Lambda   = sum_i(lambda_i)               total hazard
-          P(disease_i within T) ≈ (lambda_i / Lambda) * (1 - exp(-Lambda * T))
+        This horizon-risk diagnostic is not the same protocol as Delphi's
+        instantaneous-rate calibration. The latter evaluates rates at many
+        longitudinal prediction points, while this method extrapolates one
+        final-history prediction over the full evaluation horizon.
 
         Parameters
         ----------
@@ -241,12 +245,16 @@ class CalibrationAnalyzer:
                     targets_age=y_ages,
                 )
 
-            # time_scale logits → per-disease hazard rate
+            # DATA logits choose event identity; time logits estimate the aggregate
+            # next-event hazard.  For multi-label future occurrence calibration,
+            # disease-specific rates should therefore be:
+            #   rate_i = P(next event is disease_i) * lambda_next_event
+            # not a competing-risk probability normalized to sum to <= 1.
+            data_logits = logits['data']
             time_logits = logits.get('time_scale', logits.get('time', None))
             if time_logits is None:
                 # Fallback: use data logits with softmax (less accurate)
                 print("[WARN] No time_scale logits, falling back to softmax")
-                time_logits = logits['data']
                 use_softmax_fallback = True
             else:
                 use_softmax_fallback = False
@@ -261,29 +269,24 @@ class CalibrationAnalyzer:
                 last_pos = valid_mask.nonzero()[-1].item()
 
                 if use_softmax_fallback:
-                    probs = torch.softmax(time_logits[i, last_pos], dim=-1).cpu().numpy()
+                    probs = torch.softmax(data_logits[i, last_pos], dim=-1).cpu().numpy()
                 else:
-                    # Competing-exponentials: convert time logits to 3-year rates
+                    class_probs = torch.softmax(data_logits[i, last_pos], dim=-1)  # (V,)
                     tl = time_logits[i, last_pos]  # (V,)
 
-                    # Per-event rate: lambda_i (same formula as training loss)
-                    # lambda_i = 1 / (exp(-logit_i) + t_min)
-                    # In log space: log_lambda_i = logit_i - softplus(logit_i + log(t_min))
+                    # Aggregate next-event rate mirrors the exponential time loss:
+                    #   lambda_total = 1 / (exp(-logsumexp(time_logits)) + t_min)
+                    # AGE/dt are in days in the training loss, so T is in days.
                     import math
                     log_t_min = math.log(max(t_min, 1e-8))
-                    log_lambda = tl - torch.nn.functional.softplus(tl + log_t_min)
-                    lambda_i = torch.exp(log_lambda.clamp(max=20.0))  # (V,)
+                    lse = torch.logsumexp(tl, dim=-1)
+                    log_lambda_total = lse - torch.nn.functional.softplus(lse + log_t_min)
+                    lambda_total = torch.exp(log_lambda_total.clamp(min=-20.0, max=20.0))
 
-                    # Total competing hazard
-                    Lambda = lambda_i.sum()
-
-                    # Per-disease 3-year incidence:
-                    # P_i(T) = (lambda_i / Lambda) * (1 - exp(-Lambda * T))
-                    # T is in days (eval_years * 365.25), but lambda is in day^-1
                     T_days = eval_years * 365.25
-                    overall_prob = 1.0 - torch.exp(-Lambda * T_days)
-                    overall_prob = overall_prob.clamp(max=1.0)
-                    probs = (lambda_i / Lambda.clamp(min=1e-10)) * overall_prob
+                    lambda_i = class_probs * lambda_total
+                    probs = 1.0 - torch.exp(-lambda_i * T_days)
+                    probs = probs.clamp(min=0.0, max=1.0)
                     probs = probs.cpu().numpy()
 
                 all_pred.append(probs)
