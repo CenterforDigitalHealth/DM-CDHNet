@@ -6,7 +6,8 @@ def get_batch_composite(ix, data, p2i, select='center', index='patient', padding
                         block_size=48, device='cpu', lifestyle_augmentations=False,
                         no_event_token_rate=5, cut_batch=False, apply_token_shift=False,
                         shift_continuous=False, separate_shift_na_from_padding=False, shift_na_raw_token=4,
-                        dose_continuous=None, separate_dose_na_from_padding=None, dose_na_raw_token=None):
+                        dose_continuous=None, separate_dose_na_from_padding=None, dose_na_raw_token=None,
+                        random_pad_override=None):
     """
     Get a batch of composite data (DATA, DOSE/SHIFT, DURATION/TOTAL) from the dataset.
     
@@ -107,7 +108,14 @@ def get_batch_composite(ix, data, p2i, select='center', index='patient', padding
         shift_values = shift_values.masked_fill(na_mask, int(shift_na_raw_token))
 
     # Insert "no event" tokens
-    if (padding.lower() == 'none' or
+    if random_pad_override is not None:
+        pad = torch.as_tensor(random_pad_override, dtype=torch.float32)
+        if pad.ndim != 2 or pad.shape[0] != len(ix):
+            raise ValueError(
+                "random_pad_override must have shape "
+                f"({len(ix)}, n_pad); got {tuple(pad.shape)}"
+            )
+    elif (padding.lower() == 'none' or
             padding is None or
             no_event_token_rate == 0 or
             no_event_token_rate is None):

@@ -1980,9 +1980,9 @@ def main():
             "risk uses softmax(DATA) times the time-head probability of any event by --offset."
         ),
     )
-    parser.add_argument("--age_group_min", type=int, default=40,
+    parser.add_argument("--age_group_min", type=int, default=20,
                         help="Min age (years) for AUC age-stratification bins (prediction-time age)")
-    parser.add_argument("--age_group_max", type=int, default=80,
+    parser.add_argument("--age_group_max", type=int, default=100,
                         help="Max age (years, exclusive) for AUC age-stratification bins")
     parser.add_argument("--age_group_step", type=int, default=5,
                         help="Width of each age bin in years (must be uniform; same as get_calibration_auc)")
