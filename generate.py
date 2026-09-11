@@ -85,7 +85,7 @@ def main():
         prefix = rows[:end + 1].copy()
         anchor = int(prefix['AGE'][-1])
         end_age = min(anchor + args.horizon_days, int(rows['AGE'][-1]))
-        observed = rows[(rows['AGE'] > anchor) & (rows['AGE'] <= end_age) & clinical(rows['DATA'])]
+        observed = rows[(rows['AGE'] > anchor) & (rows['AGE'] <= end_age) & clinical(rows['EVENT'])]
         for rep in range(args.replicates):
             seed = int(np.random.SeedSequence([args.seed, int(cohort.ids[i]), rep]).generate_state(1)[0])
             generated, actions, reason = rollout(model, prefix, end_age, args.max_events, seed)
@@ -106,7 +106,7 @@ def main():
             for source, sequence in [('observed', observed), ('generated', generated)]:
                 for ri, row in enumerate(sequence):
                     records.append(dict(patient=int(row['ID']), replicate=rep, source=source, age=int(row['AGE']),
-                        token=int(row['DATA']), shift=int(row['SHIFT']), duration=int(row['TOTAL']),
+                        token=int(row['EVENT']), shift=int(row['DOSE']), duration=int(row['DUR']),
                         action=actions[ri] if source == 'generated' else None))
     with (out / 'records.csv').open('w') as f:
         writer = csv.DictWriter(f, fieldnames=['patient', 'replicate', 'source', 'age', 'token', 'shift', 'duration', 'action'])

@@ -44,12 +44,12 @@ def main():
     for i, (start, boundary, end) in enumerate(zip(index['start'], index['boundary'], index['end'])):
         history = rows[int(start):int(boundary)]
         future = rows[int(boundary):int(end)]
-        hix = np.flatnonzero(clinical(history['DATA']))
-        observed = future[clinical(future['DATA'])]
+        hix = np.flatnonzero(clinical(history['EVENT']))
+        observed = future[clinical(future['EVENT'])]
         if not len(hix) or not len(observed):
             continue
         anchor = int(history['AGE'][hix[-1]])
-        death = observed['AGE'][observed['DATA'] == DEATH]
+        death = observed['AGE'][observed['EVENT'] == DEATH]
         history_days = anchor - int(history['AGE'][hix[0]])
         complete = int(observed['AGE'][-1]) >= anchor + args.horizon_days
         terminated = len(death) and int(death[0]) <= anchor + args.horizon_days
@@ -66,7 +66,7 @@ def main():
         future = np.asarray(rows[boundary:end])
         anchor = int(index['anchor_age'][i])
         end_age = anchor + args.horizon_days
-        observed = future[(future['AGE'] <= end_age) & clinical(future['DATA'])]
+        observed = future[(future['AGE'] <= end_age) & clinical(future['EVENT'])]
         for replicate in range(args.replicates):
             seed = int(np.random.SeedSequence([args.seed, int(index['patient_id'][i]), replicate]).generate_state(1)[0])
             generated, actions, reason = rollout(model, prefix, end_age, args.max_events, seed)
@@ -86,8 +86,8 @@ def main():
             for source, sequence in (('observed', observed), ('generated', generated)):
                 for row_number, row in enumerate(sequence):
                     records.append(dict(patient=int(row['ID']), replicate=replicate, source=source,
-                        age=int(row['AGE']), token=int(row['DATA']), shift=int(row['SHIFT']),
-                        duration=int(row['TOTAL']),
+                        age=int(row['AGE']), token=int(row['EVENT']), shift=int(row['DOSE']),
+                        duration=int(row['DUR']),
                         action=actions[row_number] if source == 'generated' else None))
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=False)

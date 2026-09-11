@@ -1,4 +1,4 @@
-"""uint32 (ID, AGE in days, DATA, SHIFT, TOTAL); no synthetic events."""
+"""uint32 (ID, AGE in days, EVENT, DOSE, DUR); no synthetic events."""
 import numpy as np
 import torch
 from token_roles import DTYPE, clinical, disease, medication, MED_MIN, DEATH
@@ -17,19 +17,19 @@ class Cohort:
         self.ids = ids[self.starts].copy()
         if len(np.unique(self.ids)) != len(self.ids):
             raise ValueError('Patient records must be contiguous')
-        if np.any(self.rows['DATA'] >= 1289) or np.any(self.rows['DATA'] == 0):
+        if np.any(self.rows['EVENT'] >= 1289) or np.any(self.rows['EVENT'] == 0):
             raise ValueError('Invalid vocabulary or stored padding token')
         self.post_death_patients = self.post_death_clinical_rows = 0
         for i, (start, raw_end) in enumerate(zip(self.starts, self.raw_ends)):
             r = self.rows[start:raw_end]
             if np.any(r['AGE'][1:] < r['AGE'][:-1]):
                 raise ValueError(f'AGE is not chronological for ID {self.ids[i]}')
-            meds = medication(r['DATA'])
-            if np.any((r['SHIFT'][meds] < 1) | (r['SHIFT'][meds] > 3)):
-                raise ValueError('Medication SHIFT must be 1=increase, 2=maintain, 3=decrease')
-            deaths = np.flatnonzero(r['DATA'] == DEATH)
+            meds = medication(r['EVENT'])
+            if np.any((r['DOSE'][meds] < 1) | (r['DOSE'][meds] > 3)):
+                raise ValueError('Medication DOSE must be 1=increase, 2=maintain, 3=decrease')
+            deaths = np.flatnonzero(r['EVENT'] == DEATH)
             if len(deaths):
-                after = clinical(r['DATA'][deaths[0] + 1:])
+                after = clinical(r['EVENT'][deaths[0] + 1:])
                 self.post_death_patients += int(after.any())
                 self.post_death_clinical_rows += int(after.sum())
                 # Death is terminal in this model. Preserve the source file and
@@ -45,7 +45,7 @@ class Cohort:
     def select_endpoints(self, k):
         counts = np.zeros(1289, dtype=np.int64)
         for i in range(len(self)):
-            t = self.patient(i)['DATA']
+            t = self.patient(i)['EVENT']
             counts += np.bincount(t[disease(t)].astype(int), minlength=1289)
         return sorted(np.argsort(-counts, kind='stable')[:min(k, np.count_nonzero(counts))].tolist())
 
@@ -62,7 +62,7 @@ def features(rows, recent_days=90):
     gaps = np.zeros(n, dtype=np.float32)
     prev_clinical = None
     for j, r in enumerate(rows):
-        age, token = int(r['AGE']), int(r['DATA'])
+        age, token = int(r['AGE']), int(r['EVENT'])
         if age != day:
             day_last, day = last.copy(), age
         before[j] = day_last
@@ -74,8 +74,8 @@ def features(rows, recent_days=90):
         if clinical(token):
             gaps[j] = 0 if prev_clinical is None else age - prev_clinical
             prev_clinical = age
-    return dict(token=rows['DATA'].astype(np.int64), age=rows['AGE'].astype(np.float32),
-                shift=rows['SHIFT'].astype(np.int64), duration=rows['TOTAL'].astype(np.float32),
+    return dict(token=rows['EVENT'].astype(np.int64), age=rows['AGE'].astype(np.float32),
+                shift=rows['DOSE'].astype(np.int64), duration=rows['DUR'].astype(np.float32),
                 input_action=action, history_gap=gaps, before=before, through=through)
 
 
@@ -83,10 +83,10 @@ def window_labels(rows, age, tokens, horizons):
     y = np.zeros((len(horizons), len(tokens)), dtype=np.float32)
     valid = np.zeros_like(y, dtype=bool)
     future = rows[rows['AGE'] > age]
-    death = future['AGE'][future['DATA'] == DEATH]
+    death = future['AGE'][future['EVENT'] == DEATH]
     for h, days in enumerate(horizons):
         in_window = future[future['AGE'] <= age + days]
-        y[h] = np.isin(tokens, in_window['DATA'])
+        y[h] = np.isin(tokens, in_window['EVENT'])
         # Last record is a follow-up PROXY, not a verified enrollment end date.
         complete = int(rows['AGE'][-1]) >= age + days or (len(death) and death[0] <= age + days)
         valid[h] = (y[h] == 1) | bool(complete)
@@ -105,15 +105,15 @@ def example(rows, config, end=None, supervised=True):
     for key, dtype in [('target', np.int64), ('gap', np.float32), ('dose', np.float32),
                        ('dur', np.float32), ('valid', bool)]:
         f[key] = np.zeros(n, dtype=dtype)
-    indices = np.flatnonzero(clinical(rows['DATA']))
+    indices = np.flatnonzero(clinical(rows['EVENT']))
     if supervised:
         for a, b in zip(indices[:-1], indices[1:]):
-            if start <= a < stop and rows['DATA'][a] != DEATH:
+            if start <= a < stop and rows['EVENT'][a] != DEATH:
                 j = a - start
-                f['target'][j], f['gap'][j] = rows['DATA'][b], int(rows['AGE'][b]) - int(rows['AGE'][a])
-                f['dose'][j], f['dur'][j] = rows['SHIFT'][b] == 1, rows['TOTAL'][b]
+                f['target'][j], f['gap'][j] = rows['EVENT'][b], int(rows['AGE'][b]) - int(rows['AGE'][a])
+                f['dose'][j], f['dur'][j] = rows['DOSE'][b] == 1, rows['DUR'][b]
                 f['valid'][j] = True
-                if medication(rows['DATA'][b]) and rows['TOTAL'][b] > config.duration_max:
+                if medication(rows['EVENT'][b]) and rows['DUR'][b] > config.duration_max:
                     raise ValueError('Medication duration exceeds duration_max; do not silently clip labels')
     anchors = np.flatnonzero(clinical(f['token']))
     anchor = int(anchors[-1]) if len(anchors) else n - 1
@@ -138,7 +138,7 @@ def eligible_indices(cohort, config, landmark_sampling='left'):
     result = []
     for i in range(len(cohort)):
         rows = cohort.patient(i)
-        idx = np.flatnonzero(clinical(rows['DATA']))
+        idx = np.flatnonzero(clinical(rows['EVENT']))
         has_landmark = landmark_sampling == 'left' or len(landmark_candidates(rows)) > 0
         if len(idx) >= 2 and idx[0] < min(len(rows) - 1, config.context_length) and has_landmark:
             result.append(i)
@@ -154,13 +154,13 @@ def landmark_candidates(rows):
     same-day record set as future window data. Same-day transitions inside the
     retained history remain ordinary supervised targets.
     """
-    idx = np.flatnonzero(clinical(rows['DATA']))
+    idx = np.flatnonzero(clinical(rows['EVENT']))
     if len(idx) < 2:
         return np.empty(0, dtype=np.int64)
     ages = rows['AGE'][idx]
     last_of_day = idx[np.r_[ages[1:] != ages[:-1], True]]
     candidates = last_of_day[:-1]
-    return candidates[rows['DATA'][candidates] != DEATH]
+    return candidates[rows['EVENT'][candidates] != DEATH]
 
 
 def choose_landmark(rows, rng, mode):
@@ -175,7 +175,7 @@ def choose_landmark(rows, rng, mode):
 
 
 def landmark(rows, minimum_history_days=365):
-    idx = np.flatnonzero(clinical(rows['DATA']))
+    idx = np.flatnonzero(clinical(rows['EVENT']))
     if not len(idx):
         return None
     candidates = idx[rows['AGE'][idx] >= int(rows['AGE'][idx[0]]) + minimum_history_days]
@@ -184,4 +184,4 @@ def landmark(rows, minimum_history_days=365):
     age = rows['AGE'][candidates[0]]
     same_day = idx[rows['AGE'][idx] == age]
     end = int(same_day[-1])
-    return None if DEATH in rows['DATA'][:end + 1] else end
+    return None if DEATH in rows['EVENT'][:end + 1] else end

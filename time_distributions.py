@@ -28,9 +28,19 @@ class TimeDistribution(nn.Module, ABC):
     @abstractmethod
     def mean(self, raw): ...
 
+    @abstractmethod
+    def cdf_before(self, raw, minimum):
+        """P(integer gap < minimum), used for left-truncated rollout starts."""
+        ...
+
     def sample(self, raw, generator=None):
         u = torch.rand(raw.shape[:-1], device=raw.device, generator=generator)
         return self.quantile(raw, u)
+
+    def conditional_quantile(self, raw, u, minimum):
+        """Integer quantile conditional on the gap being at least minimum."""
+        below = self.cdf_before(raw, minimum)
+        return self.quantile(raw, below + (1 - below) * u)
 
 
 class ReferenceDailyTime(TimeDistribution):
@@ -108,6 +118,76 @@ class ReferenceDailyTime(TimeDistribution):
             tail = self.upper[-1] + (torch.log1p(-tail_u) / F.logsigmoid(-raw[..., -1]).clamp_max(-1e-12)).ceil().clamp_min(1)
             positive = torch.where(ix < 62, finite, tail)
         return torch.where(u <= rho, torch.zeros_like(positive), positive)
+
+    def cdf_before(self, raw, minimum):
+        """CDF immediately below an integer lower bound."""
+        raw, minimum = raw.float(), minimum.float().clamp_min(0)
+        rho = raw[..., 0].sigmoid()
+        threshold = (minimum - 1).clamp_min(0)
+        if self.family != 'discrete':
+            _, ls, k = self.parameters_from(raw)
+            positive = -torch.expm1(-torch.exp(
+                k * (threshold.clamp_min(1).log() - ls)))
+            positive = torch.where(threshold > 0, positive, torch.zeros_like(positive))
+        else:
+            before = torch.cat(
+                [torch.zeros_like(raw[..., :1]), F.logsigmoid(-raw[..., 1:-1]).cumsum(-1)], -1)
+            mass = (before[..., :-1] + F.logsigmoid(raw[..., 1:-1])).exp()
+            cumulative = mass.cumsum(-1)
+            ix = torch.bucketize(threshold.contiguous(), self.upper).clamp_max(62)
+            safe = ix.clamp_max(61)
+            gather = lambda x, idx: x.gather(-1, idx.unsqueeze(-1)).squeeze(-1)
+            previous = torch.cat([torch.zeros_like(cumulative[..., :1]), cumulative[..., :-1]], -1)
+            fraction = ((threshold - self.lower[safe] + 1) / self.width[safe]).clamp(0, 1)
+            finite = gather(previous, safe) + fraction * gather(mass, safe)
+            tail_survival = before[..., -1].exp() * torch.exp(
+                (threshold - self.upper[-1]).clamp_min(0) * F.logsigmoid(-raw[..., -1]))
+            positive = torch.where(ix < 62, finite, 1 - tail_survival)
+            positive = torch.where(threshold > 0, positive, torch.zeros_like(positive))
+        result = rho + (1 - rho) * positive
+        return torch.where(minimum <= 0, torch.zeros_like(result), result).clamp(0, 1 - 1e-7)
+
+    def conditional_quantile(self, raw, u, minimum):
+        raw, u = raw.float(), u.float().clamp(1e-7, 1 - 1e-7)
+        minimum = minimum.float().clamp_min(0)
+        if self.family != 'discrete':
+            _, ls, k = self.parameters_from(raw)
+            threshold = (minimum - 1).clamp_min(0)
+            cumulative_hazard = torch.pow(threshold * torch.exp(-ls), k)
+            continuous = torch.exp(ls) * torch.pow(
+                cumulative_hazard - torch.log1p(-u), 1 / k)
+            positive = continuous.ceil().clamp_min(1)
+            # Roundoff at large lower bounds can place ceil(continuous) one day
+            # below the requested integer truncation point.
+            positive = torch.maximum(positive, minimum)
+            return torch.where(minimum > 0, positive, self.quantile(raw, u))
+        # Work in log survival space so long left truncation does not round its
+        # CDF to one in float32. Each finite hazard bin is uniform over days.
+        before = torch.cat(
+            [torch.zeros_like(raw[..., :1]), F.logsigmoid(-raw[..., 1:-1]).cumsum(-1)], -1)
+        lower = torch.maximum(minimum[..., None], self.lower)
+        allowed = (self.upper - lower + 1).clamp_min(0)
+        finite_log_weight = (before[..., :-1] + F.logsigmoid(raw[..., 1:-1]) -
+                             self.width.log() + allowed.clamp_min(1).log())
+        finite_log_weight = finite_log_weight.masked_fill(allowed == 0, -torch.inf)
+        tail_start = torch.maximum(minimum, self.upper[-1] + 1)
+        tail_log_weight = (before[..., -1] +
+                           (tail_start - self.upper[-1] - 1) * F.logsigmoid(-raw[..., -1]))
+        weights = torch.cat([finite_log_weight, tail_log_weight[..., None]], -1).softmax(-1)
+        cdf = weights.cumsum(-1)
+        component = (u[..., None] > cdf).sum(-1).clamp_max(62)
+        previous = torch.cat([torch.zeros_like(cdf[..., :1]), cdf[..., :-1]], -1)
+        gather = lambda x, idx: x.gather(-1, idx.unsqueeze(-1)).squeeze(-1)
+        mass = gather(weights, component).clamp_min(1e-30)
+        local = ((u - gather(previous, component)) / mass).clamp(0, 1 - 1e-7)
+        safe = component.clamp_max(61)
+        finite_count = gather(allowed, safe).clamp_min(1)
+        finite = gather(lower, safe) + torch.floor(local * finite_count)
+        tail = tail_start + torch.floor(
+            torch.log1p(-local) / F.logsigmoid(-raw[..., -1]).clamp_max(-1e-12))
+        conditioned = torch.where(component < 62, finite, tail)
+        conditioned = torch.maximum(conditioned, minimum)
+        return torch.where(minimum > 0, conditioned, self.quantile(raw, u))
 
     def mean(self, raw):
         raw = raw.float()

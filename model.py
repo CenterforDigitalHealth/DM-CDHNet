@@ -172,7 +172,7 @@ class DurationMixture(nn.Module):
         self.head.bias[2 * k:].fill_(math.log(math.expm1(7.9)))
 
 
-class CompositeDelphi(nn.Module):
+class CDHnet(nn.Module):
     def __init__(self, config):
         super().__init__()
         config.validate()

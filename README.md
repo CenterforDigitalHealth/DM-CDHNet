@@ -43,17 +43,17 @@ python -m pip install -r requirements.txt
 python -m unittest discover -s tests -v
 ```
 
-The input is a headerless, little-endian, five-column `uint32` binary with columns `(ID, AGE, DATA, SHIFT, TOTAL)`. AGE and TOTAL are measured in days. Rows for each patient must be contiguous and ordered chronologically, while preserving the original order of events recorded on the same day. Overlapping patient IDs between TRAIN and VAL are rejected. Patient IDs must be globally consistent across all splits.
+The input is a headerless, little-endian, five-column `uint32` binary with columns `(ID, AGE, EVENT, DOSE, DUR)`. AGE and DUR are measured in days. Rows for each patient must be contiguous and ordered chronologically, while preserving the original order of events recorded on the same day. Overlapping patient IDs between TRAIN and VAL are rejected. Patient IDs must be globally consistent across all splits.
 
 | Field or code | Meaning |
 |---|---|
-| DATA 0 | Padding only; not valid in stored observations |
-| DATA 1–21 | Non-clinical input; excluded from EVENT output |
-| DATA 22–1277 | Disease tokens |
-| DATA 1278–1284 | Seven medication classes |
-| DATA 1285–1287 | Excluded from output and not treated as medication |
-| DATA 1288 | Death token; terminates generation |
-| SHIFT 1 / 2 / 3 | Increase / maintain / decrease; valid only for medication rows |
+| EVENT 0 | Padding only; not valid in stored observations |
+| EVENT 1–21 | Non-clinical input; excluded from EVENT output |
+| EVENT 22–1277 | Disease tokens |
+| EVENT 1278–1284 | Seven medication classes |
+| EVENT 1285–1287 | Excluded from output and not treated as medication |
+| EVENT 1288 | Death token; terminates generation |
+| DOSE 1 / 2 / 3 | Increase / maintain / decrease; valid only for medication rows |
 
 ```bash
 python audit_data.py --data /absolute/path/train.bin --out outputs/train_audit.json
@@ -107,7 +107,7 @@ The comparison interval is the shorter of the requested horizon and the last obs
 
 Differences between completed refill intervals cannot be interpreted in isolation. Medication counts, class-level missing refills, follow-up truncation, generation caps, and prescription duration must be considered together. `records.csv` and patient-level JSON outputs provide the source data for further analysis. This implementation does not estimate medication adherence or causal treatment effects.
 
-A future-only file such as `kr_test.bin`, which lacks sex and historical records, must not be used as a standalone cohort. First attach corrected history so that the sex-row AGE matches the AGE of the first supported clinical event (`DATA >= 22`), and store the temporal boundary. Test targets and observed future events used for generation evaluation must be strictly later than that boundary.
+A future-only file such as `kr_test.bin`, which lacks sex and historical records, must not be used as a standalone cohort. First attach corrected history so that the sex-row AGE matches the AGE of the first raw token regardless of token type, and store the temporal boundary. The first clinical event (`EVENT >= 22`) is not the reference for this correction. Use verified `*_sexage_firsttoken.bin` history and the contract in `docs/EVALUATION_PROTOCOL.md`. Test targets and observed future events used for generation evaluation must be strictly later than that boundary.
 
 ```bash
 python build_temporal_test.py --history /data/kr_train_corrected.bin /data/kr_val_corrected.bin --future /data/kr_test.bin --out outputs/kr_test_temporal

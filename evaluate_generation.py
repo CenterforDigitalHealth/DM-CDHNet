@@ -21,8 +21,8 @@ def summarize(values):
 def refill_intervals(prefix, future, end_age):
     completed, censored = [], []
     for token in range(MED_MIN, MED_MAX + 1):
-        prior = prefix['AGE'][prefix['DATA'] == token]
-        days = np.unique(future['AGE'][future['DATA'] == token]).astype(float)
+        prior = prefix['AGE'][prefix['EVENT'] == token]
+        days = np.unique(future['AGE'][future['EVENT'] == token]).astype(float)
         last = float(prior[-1]) if len(prior) else None
         for day in days:
             if last is not None and day > last:
@@ -36,18 +36,18 @@ def refill_intervals(prefix, future, end_age):
 def compare_patient(prefix, observed, generated, end_age):
     result = {}
     for name, selector in [('medication', medication), ('disease', disease)]:
-        a, b = observed['DATA'][selector(observed['DATA'])], generated['DATA'][selector(generated['DATA'])]
+        a, b = observed['EVENT'][selector(observed['EVENT'])], generated['EVENT'][selector(generated['EVENT'])]
         ca, cb = Counter(a.tolist()), Counter(b.tolist())
         keys = set(ca) | set(cb)
         result[name] = dict(observed=len(a), generated=len(b), total_count_absolute_error=abs(len(a) - len(b)),
                             class_count_l1=sum(abs(ca[k] - cb[k]) for k in keys),
                             set_precision=len(set(a) & set(b)) / len(set(b)) if len(set(b)) else None,
                             set_recall=len(set(a) & set(b)) / len(set(a)) if len(set(a)) else None)
-    result['observed_death'] = bool(np.any(observed['DATA'] == DEATH))
-    result['generated_death'] = bool(np.any(generated['DATA'] == DEATH))
+    result['observed_death'] = bool(np.any(observed['EVENT'] == DEATH))
+    result['generated_death'] = bool(np.any(generated['EVENT'] == DEATH))
     intervals = {}
     for name, rows in [('observed', observed), ('generated', generated)]:
-        death = rows['AGE'][rows['DATA'] == DEATH]
+        death = rows['AGE'][rows['EVENT'] == DEATH]
         endpoint = min(float(end_age), float(death[0])) if len(death) else float(end_age)
         complete, censored = refill_intervals(prefix, rows, endpoint)
         # Death terminates exposure; these are competing termination, not ordinary censoring.

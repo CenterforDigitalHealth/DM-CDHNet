@@ -43,12 +43,12 @@ def atomic_checkpoint(path, payload):
 
 def load_checkpoint(path, device='cpu'):
     from config import ModelConfig
-    from model import CompositeDelphi
+    from model import CDHnet
     # Checkpoints are local/trusted training artifacts, including optimizer/RNG state.
     ckpt = torch.load(path, map_location='cpu', weights_only=False)
     if ckpt.get('schema_version') != SCHEMA_VERSION or ckpt.get('format') != 'composite-delphi-0909':
         raise ValueError('Expected a 0909 checkpoint; legacy checkpoint conversion is not implicit')
-    model = CompositeDelphi(ModelConfig(**ckpt['model_config'])).to(device)
+    model = CDHnet(ModelConfig(**ckpt['model_config'])).to(device)
     model.load_state_dict(ckpt['model'], strict=True)
     model.eval()
     return model, ckpt

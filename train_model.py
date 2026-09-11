@@ -11,7 +11,7 @@ import numpy as np
 import torch
 from config import load_config, config_dict
 from data import Cohort, collate, example, eligible_indices, choose_landmark
-from model import CompositeDelphi
+from model import CDHnet
 from token_roles import medication
 from utils import seed_everything, sha256, source_manifest, write_json, atomic_checkpoint, load_checkpoint, SCHEMA_VERSION
 
@@ -70,12 +70,12 @@ def main():
     fixed_val = fixed_rng.choice(val_ix, (tc.val_batches, tc.batch_size), replace=True)
     fixed_val_end = [[choose_landmark(val.patient(int(i)), fixed_rng, tc.landmark_sampling) for i in draw]
                      for draw in fixed_val]
-    model = CompositeDelphi(mc).to(args.device)
+    model = CDHnet(mc).to(args.device)
     hist = np.zeros(mc.duration_max + 1, dtype=np.int64)
     # Training-only empirical initialization; reject values outside the head support.
     for i in range(len(train)):
         rows = train.patient(i)
-        duration = rows['TOTAL'][medication(rows['DATA'])].astype(int)
+        duration = rows['DUR'][medication(rows['EVENT'])].astype(int)
         if len(duration) and duration.max() > mc.duration_max:
             raise ValueError('Training duration exceeds configured support')
         hist += np.bincount(duration, minlength=len(hist))
