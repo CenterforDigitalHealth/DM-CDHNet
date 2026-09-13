@@ -8,8 +8,18 @@ outputs/
 tests/
 docs/
 configs/
+notes/
+tmp/
+figures/figdata
+figures/figutil
+figures/outputs/
+figures/**/*.png
+figures/**/*.pdf
+figures/**/*.svg
+figures/**/*.html
 *.sh
 *.json
+README.md
 
 # 0909
 audit_post_death.py

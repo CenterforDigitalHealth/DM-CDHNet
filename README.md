@@ -126,3 +126,15 @@ OMP_NUM_THREADS=1 python generate.py --checkpoint outputs/smoke_run/best.pt --da
 ```
 
 Synthetic smoke-test metrics are not evidence of research performance. On real-world data, compare against the existing checkpoint under fixed splits, seeds, and training budgets. When selecting a TIME distribution, evaluate not only next-event metrics but also medication counts, refill intervals, cap rates, and long-horizon distributions from multi-step generation.
+
+## Repository workspace policy
+
+- Keep files already tracked by Git at their existing paths.
+- Put newly generated scripts, scratch work, logs, and experiment outputs under `tmp/` first.
+- Keep notebooks under `figures/`. Store notebook support code and static assets in `figures/figutil/`, and store only essential figure-reproduction data (for example JSON metadata or UMAP coordinates) in `figures/figdata/`.
+- Do not save PNG, PDF, SVG, HTML, or other rendered figure outputs by default. Keep export calls commented until the figure is finalized and explicit saving is requested.
+- Before moving experiment files, check for live processes and open files. Leave every input, source dependency, checkpoint, log, and output of a running experiment in place; move them only after that experiment completes successfully.
+
+`tmp/`, `outputs/`, `figures/figdata/`, and rendered figure formats are intentionally ignored by Git. The active JMDC simulation bundle is temporarily exempt from relocation while it is running; its deferred cleanup is handled by `tmp/repo_reorganization/finalize_jmdc_bundle.sh`.
+
+The explicit root-level exception is `best_ckpt.pt`: it is a verified copy of the final checkpoint used by the active JMDC simulation bundle and must remain in the project root unless the user requests otherwise.
