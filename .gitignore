@@ -4,6 +4,8 @@ outputs/
 *.bin
 *.pt
 *.npz
+*.csv
+data/
 .venv/
 tests/
 docs/
@@ -32,7 +34,6 @@ summarize_kr_val.py
 summarize_landmark_screen.py
 evaluate_temporal_auc.py
 make_smoke_data.py
-token_roles.py
 build_temporal_test.py
 calibrate_dose.py
 audit_data.py
