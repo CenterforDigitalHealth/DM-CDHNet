@@ -1,4 +1,0 @@
-{
-  "description": "Optional exact historical-path overrides for archived research workflows. Paths may be absolute or relative to this project. Never used by the public train/evaluate/generate pipeline.",
-  "paths": {}
-}
