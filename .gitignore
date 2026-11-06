@@ -1,0 +1,100 @@
+# Source-only repository: ignore new files unless explicitly allowed below.
+# Works when this directory is the Git root, without the parent .gitignore.
+*
+!*/
+
+# Source code and notebooks. Notebook cell outputs must be cleared before commit;
+# .gitignore cannot distinguish code cells from outputs inside an .ipynb file.
+!*.py
+!*.ipynb
+!*.sh
+!*.R
+!*.r
+!*.sql
+*.ttf
+
+# Project documentation, dependencies and configuration.
+!/.gitignore
+!/.gitattributes
+!/README.md
+AGENTS.md
+LICENSE
+LICENSE.*
+requirements-analysis.txt
+!/pyproject.toml
+!/docs/**/*.md
+!/configs/*.json
+!/analysis/ablation/configs/*.json
+evaluation_policy.json
+!/simulation/first_parameters.json
+!/docs/checkpoint_provenance.json
+
+# python scripts
+prepare_temporal.py
+project_paths.py
+initialize.py
+data.py
+demo.py
+report.py
+
+# Source provenance is metadata, not model output. Do not allow all JSON/CSV files.
+# !/provenance/integration_sources.json
+# !/provenance/interpreter_paths.json
+# !/provenance/path_localization.json
+# !/provenance/pre_integration_sources.json
+# !/provenance/root_sources.json
+# !/provenance/source_inventory.json
+# !/provenance/source_paths.json
+# !/provenance/manuscript_map.csv
+
+# Required static resources: token dictionary (no patient rows), fonts and license.
+!/data/labels.csv
+!/figures/figutil/Helvetica.ttf
+!/figures/figutil/Helvetica Bold.ttf
+!/legacy/runtime_figures/figutil/Helvetica.ttf
+!/legacy/runtime_figures/figutil/Helvetica Bold.ttf
+!/scripts/third_party/DELPHI_LICENSE
+
+# Generated folders stay excluded even if they contain Python, notebooks or docs.
+outputs/
+output/
+results/
+result/
+reports/
+report/
+checkpoints/
+checkpoint/
+provenance/
+scripts/
+weights/
+legacy/
+logs/
+runs/
+analysis/
+assets/
+docs/
+data/
+figures/
+figutil/
+figdata/
+tests/
+tmp/
+temp/
+cache/
+__pycache__/
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+node_modules/
+build/
+dist/
+*.egg-info/
+
+# All other data, trained weights, figures, logs and archives are denied by '*':
+# .pt .pth .ckpt .safetensors .onnx .h5 .hdf5 .pkl .joblib .bin .npy .npz
+# .csv .tsv .parquet .feather .arrow .json .jsonl .log .pdf .png .svg .jpg
+# .xlsx .docx .pptx .html .zip .tar .gz and secrets such as .env or key files.

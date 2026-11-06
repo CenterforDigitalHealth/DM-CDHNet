@@ -1,0 +1,20 @@
+{
+  "bias_insulin": -0.3065054565680176,
+  "bias_other": -0.5215469243957841,
+  "transitions": 1851251,
+  "observed_first": [
+    366,
+    12
+  ],
+  "expected_first_before": [
+    494.7038701241119,
+    23.443689408052293
+  ],
+  "expected_first_after": [
+    367.134845816482,
+    13.931027590937363
+  ],
+  "objective_delta": -1.163684448605133e-05,
+  "fit_patients": 20000,
+  "scope": "FIRST action only; complete EVENT normalization"
+}
